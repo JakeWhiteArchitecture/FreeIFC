@@ -34,9 +34,9 @@ from vtkmodules.vtkRenderingCore import (
     vtkActor, vtkPolyDataMapper, vtkRenderer,
 )
 from vtkmodules.vtkRenderingLOD import vtkLODActor
-from vtkmodules.vtkInteractionStyle import vtkInteractorStyleTrackballCamera
+from vtkmodules.vtkInteractionStyle import vtkInteractorStyle
 from vtkmodules.vtkRenderingCore import vtkCellPicker
-from vtkmodules.vtkRenderingAnnotation import vtkAnnotatedCubeActor
+from vtkmodules.vtkRenderingAnnotation import vtkAxesActor
 from vtkmodules.vtkInteractionWidgets import vtkOrientationMarkerWidget
 
 from vtkmodules.qt.QVTKRenderWindowInteractor import QVTKRenderWindowInteractor
@@ -314,6 +314,7 @@ class FreeIFCWindow(QMainWindow):
         self._lod_enabled = False
         self._lod_cloud_points = 5000000
         self._orbiting = False
+        self._panning = False
         self._last_mouse_pos = (0, 0)
 
         # ── Layout ───────────────────────────────────────────────────────
@@ -323,11 +324,7 @@ class FreeIFCWindow(QMainWindow):
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
 
-        # VTK widget
-        self._vtk_widget = QVTKRenderWindowInteractor(central)
-        main_layout.addWidget(self._vtk_widget, stretch=1)
-
-        # Side panel
+        # Side panel (left side)
         side = QWidget()
         side.setFixedWidth(320)
         side.setStyleSheet("""
@@ -431,18 +428,18 @@ class FreeIFCWindow(QMainWindow):
         bg_lay = QVBoxLayout(bg_group)
         bg_lay.setSpacing(6)
 
-        # Centre colour
+        # Edge colour (outer)
         row1 = QHBoxLayout()
-        row1.addWidget(QLabel("Centre"))
-        self._centre_swatch = ColourSwatchButton(self._bg_centre)
-        self._centre_swatch.colour_changed.connect(self._on_bg_centre_changed)
-        row1.addWidget(self._centre_swatch)
-        row1.addStretch()
-        # Edge colour
         row1.addWidget(QLabel("Edge"))
         self._edge_swatch = ColourSwatchButton(self._bg_edge)
         self._edge_swatch.colour_changed.connect(self._on_bg_edge_changed)
         row1.addWidget(self._edge_swatch)
+        row1.addStretch()
+        # Centre colour (inner)
+        row1.addWidget(QLabel("Centre"))
+        self._centre_swatch = ColourSwatchButton(self._bg_centre)
+        self._centre_swatch.colour_changed.connect(self._on_bg_centre_changed)
+        row1.addWidget(self._centre_swatch)
         row1.addStretch()
         bg_lay.addLayout(row1)
 
@@ -486,6 +483,10 @@ class FreeIFCWindow(QMainWindow):
 
         main_layout.addWidget(side)
 
+        # VTK widget (right of sidebar)
+        self._vtk_widget = QVTKRenderWindowInteractor(central)
+        main_layout.addWidget(self._vtk_widget, stretch=1)
+
         # ── VTK setup ────────────────────────────────────────────────────
         renwin = self._vtk_widget.GetRenderWindow()
 
@@ -520,39 +521,49 @@ class FreeIFCWindow(QMainWindow):
         self._grid_actor = _make_grid_actor()
         self.renderer.AddActor(self._grid_actor)
 
-        # Navigation cube
-        cube = vtkAnnotatedCubeActor()
-        cube.SetXPlusFaceText("E")
-        cube.SetXMinusFaceText("W")
-        cube.SetYPlusFaceText("N")
-        cube.SetYMinusFaceText("S")
-        cube.SetZPlusFaceText("Top")
-        cube.SetZMinusFaceText("Bot")
-        cube.GetTextEdgesProperty().SetColor(0.18, 0.18, 0.18)
-        cube.GetTextEdgesProperty().SetLineWidth(1)
-        cube.GetCubeProperty().SetColor(0.24, 0.25, 0.28)
-        for face_prop in (
-            cube.GetXPlusFaceProperty(), cube.GetXMinusFaceProperty(),
-            cube.GetYPlusFaceProperty(), cube.GetYMinusFaceProperty(),
-            cube.GetZPlusFaceProperty(), cube.GetZMinusFaceProperty(),
-        ):
-            face_prop.SetColor(0.24, 0.25, 0.28)
+        # XYZ axes widget (like Blender) — top right
+        axes = vtkAxesActor()
+        axes.SetShaftTypeToCylinder()
+        axes.SetCylinderRadius(0.05)
+        axes.SetTipLength(0.2)
+        axes.SetTotalLength(1.0, 1.0, 1.0)
+        axes.SetXAxisLabelText("X")
+        axes.SetYAxisLabelText("Y")
+        axes.SetZAxisLabelText("Z")
+        # Red X, Green Y, Blue Z — Blender convention
+        axes.GetXAxisShaftProperty().SetColor(0.9, 0.2, 0.25)
+        axes.GetXAxisTipProperty().SetColor(0.9, 0.2, 0.25)
+        axes.GetYAxisShaftProperty().SetColor(0.55, 0.75, 0.15)
+        axes.GetYAxisTipProperty().SetColor(0.55, 0.75, 0.15)
+        axes.GetZAxisShaftProperty().SetColor(0.3, 0.55, 0.95)
+        axes.GetZAxisTipProperty().SetColor(0.3, 0.55, 0.95)
+        for prop in (axes.GetXAxisCaptionActor2D().GetCaptionTextProperty(),
+                     axes.GetYAxisCaptionActor2D().GetCaptionTextProperty(),
+                     axes.GetZAxisCaptionActor2D().GetCaptionTextProperty()):
+            prop.SetFontSize(14)
+            prop.SetBold(True)
+            prop.SetItalic(False)
+            prop.SetShadow(False)
+            prop.SetColor(0.85, 0.85, 0.85)
 
         self._orientation_widget = vtkOrientationMarkerWidget()
-        self._orientation_widget.SetOrientationMarker(cube)
-        self._orientation_widget.SetViewport(0.85, 0.0, 1.0, 0.15)
+        self._orientation_widget.SetOrientationMarker(axes)
+        self._orientation_widget.SetViewport(0.85, 0.85, 1.0, 1.0)
 
-        # Interaction style — use trackball camera as base but we override
-        # rotation via mouse observers to get Z-axis azimuth orbit
-        base_style = vtkInteractorStyleTrackballCamera()
+        # Bare interactor style — we handle all interaction via observers
+        # This prevents the base style from entering its own rotate/zoom modes
+        bare_style = vtkInteractorStyle()
 
         iren = self._vtk_widget.GetRenderWindow().GetInteractor()
-        iren.SetInteractorStyle(base_style)
+        iren.SetInteractorStyle(bare_style)
 
-        # Custom orbit: horizontal drag = azimuth (Z-axis), vertical = elevation
-        # Override left-button rotation to lock up-vector to Z
+        # Left-button: click to select, drag to orbit
         iren.AddObserver("LeftButtonPressEvent", self._on_left_press)
         iren.AddObserver("LeftButtonReleaseEvent", self._on_left_release)
+        # Middle-button: pan
+        iren.AddObserver("MiddleButtonPressEvent", self._on_middle_press)
+        iren.AddObserver("MiddleButtonReleaseEvent", self._on_middle_release)
+        # Mouse move: orbit or pan depending on state
         iren.AddObserver("MouseMoveEvent", self._on_mouse_move)
         # Right-click for context menu
         iren.AddObserver("RightButtonPressEvent", self._on_right_click)
@@ -650,7 +661,7 @@ class FreeIFCWindow(QMainWindow):
         iren = self._vtk_widget.GetRenderWindow().GetInteractor()
         click_pos = iren.GetEventPosition()
 
-        # First do picking for selection
+        # Pick for selection
         self._picker.Pick(click_pos[0], click_pos[1], 0, self.renderer)
         picked_actor = self._picker.GetActor()
 
@@ -666,8 +677,9 @@ class FreeIFCWindow(QMainWindow):
                 else:
                     self._select(guid)
                 self._vtk_widget.GetRenderWindow().Render()
+                # Don't start orbit when clicking on an element
                 return
-        elif picked_actor is None or picked_actor is self._grid_actor:
+        else:
             if self._selected_guid is not None:
                 self._deselect()
                 self._vtk_widget.GetRenderWindow().Render()
@@ -679,11 +691,16 @@ class FreeIFCWindow(QMainWindow):
     def _on_left_release(self, obj, event):
         self._orbiting = False
 
+    def _on_middle_press(self, obj, event):
+        iren = self._vtk_widget.GetRenderWindow().GetInteractor()
+        self._panning = True
+        self._last_mouse_pos = iren.GetEventPosition()
+
+    def _on_middle_release(self, obj, event):
+        self._panning = False
+
     def _on_mouse_move(self, obj, event):
-        if not self._orbiting:
-            # Forward to default style for other interactions
-            iren = self._vtk_widget.GetRenderWindow().GetInteractor()
-            iren.GetInteractorStyle().OnMouseMove()
+        if not self._orbiting and not self._panning:
             return
 
         iren = self._vtk_widget.GetRenderWindow().GetInteractor()
@@ -694,14 +711,43 @@ class FreeIFCWindow(QMainWindow):
 
         cam = self.renderer.GetActiveCamera()
 
-        # Horizontal drag → azimuth (rotate around Z axis)
-        cam.Azimuth(-dx * 0.5)
-        # Vertical drag → elevation (tilt up/down)
-        cam.Elevation(-dy * 0.5)
-
-        # Lock up-vector to Z to prevent flipping
-        cam.SetViewUp(0, 0, 1)
-        cam.OrthogonalizeViewUp()
+        if self._orbiting:
+            # Horizontal drag → azimuth (rotate around Z axis)
+            cam.Azimuth(-dx * 0.5)
+            # Vertical drag → elevation (tilt up/down)
+            cam.Elevation(-dy * 0.5)
+            # Lock up-vector to Z to prevent flipping
+            cam.SetViewUp(0, 0, 1)
+            cam.OrthogonalizeViewUp()
+        elif self._panning:
+            # Pan: translate camera and focal point
+            renwin = self._vtk_widget.GetRenderWindow()
+            size = renwin.GetSize()
+            fp = cam.GetFocalPoint()
+            pos3d = cam.GetPosition()
+            # Calculate pan amount based on distance from camera to focal point
+            dist = math.sqrt(sum((a - b) ** 2 for a, b in zip(pos3d, fp)))
+            view_angle = cam.GetViewAngle()
+            pan_scale = 2.0 * dist * math.tan(math.radians(view_angle / 2.0)) / size[1]
+            # Get camera axes
+            cam.OrthogonalizeViewUp()
+            right = [0, 0, 0]
+            up = list(cam.GetViewUp())
+            view_dir = [fp[i] - pos3d[i] for i in range(3)]
+            # Cross product: right = view_dir x up
+            right[0] = view_dir[1] * up[2] - view_dir[2] * up[1]
+            right[1] = view_dir[2] * up[0] - view_dir[0] * up[2]
+            right[2] = view_dir[0] * up[1] - view_dir[1] * up[0]
+            # Normalize
+            mag = math.sqrt(sum(r * r for r in right))
+            if mag > 0:
+                right = [r / mag for r in right]
+            # Pan
+            pan_x = -dx * pan_scale
+            pan_y = -dy * pan_scale
+            delta = [pan_x * right[i] + pan_y * up[i] for i in range(3)]
+            cam.SetFocalPoint(*[fp[i] + delta[i] for i in range(3)])
+            cam.SetPosition(*[pos3d[i] + delta[i] for i in range(3)])
 
         self.renderer.ResetCameraClippingRange()
         self._vtk_widget.GetRenderWindow().Render()
