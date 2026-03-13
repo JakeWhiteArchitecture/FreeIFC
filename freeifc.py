@@ -1004,9 +1004,6 @@ class FreeIFCWindow(QMainWindow):
 
         self._props[guid] = props
 
-        if len(self._actors) % 100 == 0:
-            self._vtk_widget.GetRenderWindow().Render()
-
     def _on_load_progress(self, done: int, total: int):
         self._progress.setMaximum(total)
         self._progress.setValue(done)
