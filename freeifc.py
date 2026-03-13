@@ -201,33 +201,51 @@ class LoaderThread(QThread):
 # ── Ground plane grid ────────────────────────────────────────────────────────
 
 def _make_grid_actor(size=100.0, spacing=1.0):
+    from vtkmodules.vtkCommonCore import vtkUnsignedCharArray
     points = vtkPoints()
     lines = vtkCellArray()
+    colours = vtkUnsignedCharArray()
+    colours.SetNumberOfComponents(4)  # RGBA
+    colours.SetName("Colours")
     n = int(size / spacing)
     half = n * spacing / 2.0
     idx = 0
+    base_r, base_g, base_b = 46, 48, 54  # grid line colour
     for i in range(n + 1):
         x = -half + i * spacing
+        # Horizontal line: (x, -half) to (x, half)
         points.InsertNextPoint(x, -half, 0)
         points.InsertNextPoint(x,  half, 0)
         lines.InsertNextCell(2)
         lines.InsertCellPoint(idx)
         lines.InsertCellPoint(idx + 1)
+        # Fade: alpha based on distance of each endpoint from origin
+        for py in (-half, half):
+            dist = math.sqrt(x * x + py * py)
+            alpha = max(0, int(255 * max(0.0, 1.0 - dist / half)))
+            colours.InsertNextTuple4(base_r, base_g, base_b, alpha)
         idx += 2
+        # Vertical line: (-half, x) to (half, x)
         points.InsertNextPoint(-half, x, 0)
         points.InsertNextPoint( half, x, 0)
         lines.InsertNextCell(2)
         lines.InsertCellPoint(idx)
         lines.InsertCellPoint(idx + 1)
+        for px in (-half, half):
+            dist = math.sqrt(px * px + x * x)
+            alpha = max(0, int(255 * max(0.0, 1.0 - dist / half)))
+            colours.InsertNextTuple4(base_r, base_g, base_b, alpha)
         idx += 2
     grid = vtkPolyData()
     grid.SetPoints(points)
     grid.SetLines(lines)
+    grid.GetPointData().SetScalars(colours)
     mapper = vtkPolyDataMapper()
     mapper.SetInputData(grid)
+    mapper.SetScalarModeToUsePointData()
+    mapper.SetColorModeToDirectScalars()
     actor = vtkActor()
     actor.SetMapper(mapper)
-    actor.GetProperty().SetColor(0.18, 0.19, 0.21)
     actor.GetProperty().SetLineWidth(1.0)
     actor.SetPickable(False)
     return actor
@@ -277,8 +295,8 @@ class FreeIFCWindow(QMainWindow):
         self.setAcceptDrops(True)
 
         # Background settings
-        self._bg_centre = QColor(30, 31, 40)    # lighter centre
-        self._bg_edge   = QColor(10, 12, 15)    # darker edge
+        self._bg_centre = QColor(128, 128, 140)  # lighter centre
+        self._bg_edge   = QColor(255, 255, 255) # brighter edge
         self._bg_intensity = 100                  # 0–200 scale percent
 
         # Menu bar
@@ -316,6 +334,7 @@ class FreeIFCWindow(QMainWindow):
         self._orbiting = False
         self._panning = False
         self._last_mouse_pos = (0, 0)
+        self._right_press_pos = (0, 0)
 
         # ── Layout ───────────────────────────────────────────────────────
         central = QWidget()
@@ -499,7 +518,8 @@ class FreeIFCWindow(QMainWindow):
         self.renderer.SetMaximumNumberOfPeels(8)
         self.renderer.SetOcclusionRatio(0.1)
         renwin.SetAlphaBitPlanes(True)
-        renwin.SetMultiSamples(0)
+        renwin.SetMultiSamples(0)  # must be 0 for depth peeling
+        self.renderer.SetUseFXAA(True)  # anti-aliasing for lines
         renwin.SetNumberOfLayers(2)
         renwin.AddRenderer(self.renderer)
 
@@ -695,25 +715,10 @@ class FreeIFCWindow(QMainWindow):
         pass
 
     def _on_middle_press(self, obj, event):
-        """Middle-click: pan, or show context menu if clicking an element."""
+        """Middle-click: pan."""
         iren = self._vtk_widget.GetRenderWindow().GetInteractor()
-        click_pos = iren.GetEventPosition()
-
-        # Check if clicking on an element — show hide context menu
-        self._picker.Pick(click_pos[0], click_pos[1], 0, self.renderer)
-        picked_actor = self._picker.GetActor()
-        if picked_actor is not None and picked_actor is not self._grid_actor:
-            guid = None
-            for g, a in self._actors.items():
-                if a is picked_actor:
-                    guid = g
-                    break
-            if guid is not None:
-                self._show_hide_menu(guid, click_pos)
-                return
-
         self._panning = True
-        self._last_mouse_pos = click_pos
+        self._last_mouse_pos = iren.GetEventPosition()
 
     def _on_middle_release(self, obj, event):
         self._panning = False
@@ -813,18 +818,36 @@ class FreeIFCWindow(QMainWindow):
             child.setCheckState(0, Qt.CheckState.Checked)
             self._reset_tree_checks(child)
 
-    # ── Right-click = orbit drag ─────────────────────────────────────────
+    # ── Right-click = orbit drag / context menu ─────────────────────────
 
     def _on_right_press(self, obj, event):
-        """Right-drag: orbit."""
+        """Right-press: start orbit drag, track start pos for click detection."""
         iren = self._vtk_widget.GetRenderWindow().GetInteractor()
         self._orbiting = True
-        self._last_mouse_pos = iren.GetEventPosition()
+        pos = iren.GetEventPosition()
+        self._last_mouse_pos = pos
+        self._right_press_pos = pos  # track for click vs drag detection
 
     def _on_right_release(self, obj, event):
         self._orbiting = False
+        iren = self._vtk_widget.GetRenderWindow().GetInteractor()
+        pos = iren.GetEventPosition()
+        # If mouse barely moved, treat as a click → show context menu
+        dx = abs(pos[0] - self._right_press_pos[0])
+        dy = abs(pos[1] - self._right_press_pos[1])
+        if dx < 4 and dy < 4:
+            self._picker.Pick(pos[0], pos[1], 0, self.renderer)
+            picked_actor = self._picker.GetActor()
+            if picked_actor is not None and picked_actor is not self._grid_actor:
+                guid = None
+                for g, a in self._actors.items():
+                    if a is picked_actor:
+                        guid = g
+                        break
+                if guid is not None:
+                    self._show_hide_menu(guid, pos)
 
-    # ── Context menu (middle-click on element) ────────────────────────────
+    # ── Context menu ──────────────────────────────────────────────────────
 
     def _show_hide_menu(self, guid: str, click_pos):
         menu = QMenu(self)
