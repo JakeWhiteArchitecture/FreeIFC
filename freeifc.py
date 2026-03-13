@@ -525,7 +525,7 @@ class FreeIFCWindow(QMainWindow):
         axes = vtkAxesActor()
         axes.SetShaftTypeToCylinder()
         axes.SetCylinderRadius(0.05)
-        axes.SetTipLength(0.2)
+        axes.SetConeRadius(0.15)
         axes.SetTotalLength(1.0, 1.0, 1.0)
         axes.SetXAxisLabelText("X")
         axes.SetYAxisLabelText("Y")
