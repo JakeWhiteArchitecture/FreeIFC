@@ -138,13 +138,17 @@ class LoaderThread(QThread):
         # ── Try IfcConvert (fast C++ path) ───────────────────────────
         ifcconvert = shutil.which("IfcConvert") or shutil.which("ifcconvert")
         if ifcconvert:
+            self.status_update.emit(f"Found IfcConvert: {ifcconvert}")
             elements = self._load_via_ifcconvert(ifcconvert)
+            if elements:
+                self.status_update.emit(f"IfcConvert: {len(elements)} elements loaded")
         else:
+            self.status_update.emit("IfcConvert not on PATH, using Python fallback…")
             elements = None
 
         # ── Fallback: ifcopenshell.geom.iterator ─────────────────────
         if elements is None:
-            self.status_update.emit("Tessellating geometry (Python fallback)…")
+            self.status_update.emit("Falling back to ifcopenshell tessellation…")
             elements = self._load_via_iterator()
 
         if elements is None:
@@ -192,7 +196,8 @@ class LoaderThread(QThread):
         try:
             import trimesh
         except ImportError:
-            return None  # trimesh not available, use fallback
+            self.status_update.emit("trimesh not installed, using fallback…")
+            return None
 
         glb_path = self.path + ".tmp.glb"
         self.status_update.emit("Converting IFC geometry (IfcConvert)…")
@@ -204,14 +209,26 @@ class LoaderThread(QThread):
                 capture_output=True, text=True, timeout=600,
             )
             if result.returncode != 0:
-                return None  # fall back to iterator
-        except Exception:
+                stderr = result.stderr.strip()[:300] if result.stderr else "unknown error"
+                self.status_update.emit(f"IfcConvert failed (code {result.returncode}): {stderr}")
+                return None
+        except subprocess.TimeoutExpired:
+            self.status_update.emit("IfcConvert timed out (10 min), using fallback…")
+            return None
+        except Exception as exc:
+            self.status_update.emit(f"IfcConvert error: {exc}")
             return None
 
-        self.status_update.emit("Loading GLB geometry…")
+        if not os.path.isfile(glb_path):
+            self.status_update.emit("IfcConvert produced no output file, using fallback…")
+            return None
+
+        glb_size = os.path.getsize(glb_path)
+        self.status_update.emit(f"Loading GLB geometry ({glb_size / 1048576:.1f} MB)…")
         try:
             scene = trimesh.load(glb_path, process=False)
-        except Exception:
+        except Exception as exc:
+            self.status_update.emit(f"GLB load failed: {exc}")
             return None
         finally:
             try:
