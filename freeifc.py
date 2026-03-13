@@ -35,7 +35,7 @@ from vtkmodules.vtkRenderingCore import (
 )
 from vtkmodules.vtkRenderingLOD import vtkLODActor
 from vtkmodules.vtkInteractionStyle import vtkInteractorStyleTrackballCamera
-from vtkmodules.vtkRenderingCore import vtkCellPicker
+from vtkmodules.vtkRenderingCore import vtkPropPicker
 from vtkmodules.vtkRenderingAnnotation import vtkAxesActor
 from vtkmodules.vtkInteractionWidgets import vtkOrientationMarkerWidget
 
@@ -599,8 +599,7 @@ class FreeIFCWindow(QMainWindow):
         iren.AddObserver("MouseWheelBackwardEvent", self._on_wheel_backward)
 
         # Picker
-        self._picker = vtkCellPicker()
-        self._picker.SetTolerance(0.005)
+        self._picker = vtkPropPicker()
 
         # Start interactor
         self._vtk_widget.Initialize()
