@@ -80,10 +80,13 @@ def _opacity_for(ifc_type: str):
 # ── Background loader thread ────────────────────────────────────────────────
 
 class LoaderThread(QThread):
-    element_ready = pyqtSignal(str, object, object, dict)
+    # Emits batches of prepared VTK polydata: list of (guid, polydata, props)
+    batch_ready   = pyqtSignal(list)
     load_progress = pyqtSignal(int, int)
     load_complete = pyqtSignal(dict)
     load_error    = pyqtSignal(str)
+
+    BATCH_SIZE = 200
 
     def __init__(self, path: str):
         super().__init__()
@@ -125,6 +128,7 @@ class LoaderThread(QThread):
         n_done = 0
         all_products = model.by_type("IfcProduct")
         n_total = len(all_products)
+        batch = []
 
         while True:
             try:
@@ -146,18 +150,35 @@ class LoaderThread(QThread):
                         if val:
                             props[attr] = val
 
-                    self.element_ready.emit(shape.guid, verts, faces, props)
+                    # Build VTK polydata + normals in worker thread
+                    polydata = _make_polydata(verts, faces)
+                    normals = vtkPolyDataNormals()
+                    normals.SetInputData(polydata)
+                    normals.ComputePointNormalsOn()
+                    normals.SplittingOff()
+                    normals.Update()
+
+                    batch.append((shape.guid, normals.GetOutput(), props))
             except Exception:
                 pass
 
             n_done += 1
-            self.load_progress.emit(n_done, n_total)
+            if n_done % self.BATCH_SIZE == 0:
+                self.load_progress.emit(n_done, n_total)
+                if batch:
+                    self.batch_ready.emit(batch)
+                    batch = []
 
             try:
                 if not iterator.next():
                     break
             except Exception:
                 break
+
+        # Emit remaining batch
+        if batch:
+            self.batch_ready.emit(batch)
+        self.load_progress.emit(n_done, n_total)
 
         hierarchy = self._build_hierarchy(model)
         self.load_complete.emit(hierarchy)
@@ -938,7 +959,7 @@ class FreeIFCWindow(QMainWindow):
         self.setWindowTitle(f"FreeIFC — {os.path.basename(path)}")
 
         self._loader = LoaderThread(path)
-        self._loader.element_ready.connect(self._on_element_ready)
+        self._loader.batch_ready.connect(self._on_batch_ready)
         self._loader.load_progress.connect(self._on_load_progress)
         self._loader.load_complete.connect(self._on_load_complete)
         self._loader.load_error.connect(self._on_load_error)
@@ -967,42 +988,31 @@ class FreeIFCWindow(QMainWindow):
 
     # ── Loader signals ───────────────────────────────────────────────────
 
-    def _on_element_ready(self, guid: str, verts: np.ndarray, faces: np.ndarray, props: dict):
-        ifc_type = props.get("Type", "")
-        colour = _colour_for(ifc_type)
-        opacity = _opacity_for(ifc_type)
+    def _on_batch_ready(self, batch: list):
+        """Receive a batch of (guid, polydata, props) from the worker thread."""
+        lod_pts = self._lod_cloud_points if self._lod_enabled else 999999999
+        for guid, normals_output, props in batch:
+            ifc_type = props.get("Type", "")
+            colour = _colour_for(ifc_type)
+            opacity = _opacity_for(ifc_type)
 
-        polydata = _make_polydata(verts, faces)
+            mapper = vtkPolyDataMapper()
+            mapper.SetInputData(normals_output)
+            actor = vtkLODActor()
+            actor.SetMapper(mapper)
+            actor.SetNumberOfCloudPoints(lod_pts)
+            actor.GetProperty().SetColor(*colour)
+            actor.GetProperty().SetOpacity(opacity)
+            actor.GetProperty().SetAmbient(1.0)
+            actor.GetProperty().SetDiffuse(0.0)
+            actor.GetProperty().LightingOff()
+            actor.GetProperty().SetInterpolationToFlat()
+            self.renderer.AddActor(actor)
+            self._actors[guid] = actor
 
-        normals = vtkPolyDataNormals()
-        normals.SetInputData(polydata)
-        normals.ComputePointNormalsOn()
-        normals.SplittingOff()
-        normals.Update()
-        normals_output = normals.GetOutput()
-
-        # Scene actor — flat shading, no light source
-        mapper = vtkPolyDataMapper()
-        mapper.SetInputData(normals_output)
-        actor = vtkLODActor()
-        actor.SetMapper(mapper)
-        if self._lod_enabled:
-            actor.SetNumberOfCloudPoints(self._lod_cloud_points)
-        else:
-            actor.SetNumberOfCloudPoints(999999999)
-        actor.GetProperty().SetColor(*colour)
-        actor.GetProperty().SetOpacity(opacity)
-        actor.GetProperty().SetAmbient(1.0)
-        actor.GetProperty().SetDiffuse(0.0)
-        actor.GetProperty().LightingOff()
-        actor.GetProperty().SetInterpolationToFlat()
-        self.renderer.AddActor(actor)
-        self._actors[guid] = actor
-
-        # Store polydata for deferred edge/outline extraction
-        self._polydata[guid] = normals_output
-
-        self._props[guid] = props
+            # Store polydata for deferred edge/outline extraction
+            self._polydata[guid] = normals_output
+            self._props[guid] = props
 
     def _on_load_progress(self, done: int, total: int):
         self._progress.setMaximum(total)
