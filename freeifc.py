@@ -229,6 +229,13 @@ class FreeIFCWindow(QMainWindow):
         self.resize(1400, 900)
         self.setAcceptDrops(True)
 
+        # Menu bar
+        menu_bar = self.menuBar()
+        file_menu = menu_bar.addMenu("File")
+        open_action = file_menu.addAction("Open…")
+        open_action.setShortcut("Ctrl+O")
+        open_action.triggered.connect(self._on_open_clicked)
+
         # State
         self._actors: dict[str, vtkLODActor] = {}       # guid → scene actor
         self._outlines: dict[str, vtkActor] = {}         # guid → outline actor
