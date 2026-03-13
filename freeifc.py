@@ -550,24 +550,30 @@ class FreeIFCWindow(QMainWindow):
         self._orientation_widget.SetOrientationMarker(axes)
         self._orientation_widget.SetViewport(0.85, 0.85, 1.0, 1.0)
 
-        # Use trackball camera but we fully override left-button via observers
-        # to prevent the base style's rotate mode from getting stuck
-        bare_style = vtkInteractorStyleTrackballCamera()
+        # Neutered trackball style — override all button handlers to no-ops
+        # so the base style NEVER enters its own rotate/zoom/pan modes.
+        # All interaction is handled purely by our own observers below.
+        style = vtkInteractorStyleTrackballCamera()
+        style.AddObserver("LeftButtonPressEvent", lambda o, e: None)
+        style.AddObserver("LeftButtonReleaseEvent", lambda o, e: None)
+        style.AddObserver("RightButtonPressEvent", lambda o, e: None)
+        style.AddObserver("RightButtonReleaseEvent", lambda o, e: None)
+        style.AddObserver("MiddleButtonPressEvent", lambda o, e: None)
+        style.AddObserver("MiddleButtonReleaseEvent", lambda o, e: None)
+        style.AddObserver("MouseWheelForwardEvent", lambda o, e: None)
+        style.AddObserver("MouseWheelBackwardEvent", lambda o, e: None)
+        style.AddObserver("MouseMoveEvent", lambda o, e: None)
 
         iren = self._vtk_widget.GetRenderWindow().GetInteractor()
-        iren.SetInteractorStyle(bare_style)
+        iren.SetInteractorStyle(style)
 
-        # Left-button: click to select, drag to orbit
+        # Our own interaction handlers — these are the ONLY ones that run
         iren.AddObserver("LeftButtonPressEvent", self._on_left_press)
         iren.AddObserver("LeftButtonReleaseEvent", self._on_left_release)
-        # Middle-button: pan
         iren.AddObserver("MiddleButtonPressEvent", self._on_middle_press)
         iren.AddObserver("MiddleButtonReleaseEvent", self._on_middle_release)
-        # Mouse move: orbit or pan depending on state
         iren.AddObserver("MouseMoveEvent", self._on_mouse_move)
-        # Right-click for context menu
         iren.AddObserver("RightButtonPressEvent", self._on_right_click)
-        # Scroll zoom
         iren.AddObserver("MouseWheelForwardEvent", self._on_wheel_forward)
         iren.AddObserver("MouseWheelBackwardEvent", self._on_wheel_backward)
 
@@ -690,9 +696,6 @@ class FreeIFCWindow(QMainWindow):
 
     def _on_left_release(self, obj, event):
         self._orbiting = False
-        # Ensure the base style exits any mode it might have entered
-        iren = self._vtk_widget.GetRenderWindow().GetInteractor()
-        iren.GetInteractorStyle().OnLeftButtonUp()
 
     def _on_middle_press(self, obj, event):
         iren = self._vtk_widget.GetRenderWindow().GetInteractor()
@@ -701,8 +704,6 @@ class FreeIFCWindow(QMainWindow):
 
     def _on_middle_release(self, obj, event):
         self._panning = False
-        iren = self._vtk_widget.GetRenderWindow().GetInteractor()
-        iren.GetInteractorStyle().OnMiddleButtonUp()
 
     def _on_mouse_move(self, obj, event):
         if not self._orbiting and not self._panning:
