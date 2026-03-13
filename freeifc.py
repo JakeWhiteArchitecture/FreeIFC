@@ -14,7 +14,6 @@ import os
 import math
 import shutil
 import subprocess
-import pickle
 import numpy as np
 
 import ifcopenshell
@@ -100,19 +99,28 @@ class LoaderThread(QThread):
         self.path = path
 
     def run(self):
-        cache_path = self.path + ".freeifc"
+        cache_path = self.path + ".freeifc.npz"
         ifc_mtime = os.path.getmtime(self.path)
 
         # ── Try cache ────────────────────────────────────────────────
         if os.path.isfile(cache_path):
             try:
-                with open(cache_path, "rb") as f:
-                    cache = pickle.load(f)
-                if cache.get("mtime", 0) >= ifc_mtime:
+                cache = np.load(cache_path, allow_pickle=True)
+                stored_mtime = float(cache["_mtime"])
+                if stored_mtime >= ifc_mtime:
                     self.status_update.emit("Loading cached geometry…")
-                    elements = cache["elements"]
+                    guids = list(cache["_guids"])
+                    types = list(cache["_types"])
+                    elements = {}
+                    for i, guid in enumerate(guids):
+                        elements[guid] = {
+                            "verts": cache[f"v_{i}"],
+                            "faces": cache[f"f_{i}"],
+                            "type": str(types[i]),
+                        }
+                    cache.close()
                     model = ifcopenshell.open(self.path)
-                    for guid in list(elements.keys()):
+                    for guid in elements:
                         try:
                             el = model.by_guid(guid)
                             elements[guid]["props"] = self._build_props(el)
@@ -164,18 +172,16 @@ class LoaderThread(QThread):
 
         hierarchy = self._build_hierarchy(model)
 
-        # ── Save cache ───────────────────────────────────────────────
+        # ── Save cache (npz — memory-efficient) ──────────────────────
         self.status_update.emit("Saving cache…")
         try:
-            cache_data = {
-                "mtime": ifc_mtime,
-                "elements": {
-                    guid: {"verts": e["verts"], "faces": e["faces"], "type": e.get("type", "")}
-                    for guid, e in elements.items()
-                },
-            }
-            with open(cache_path, "wb") as f:
-                pickle.dump(cache_data, f, protocol=5)
+            guids = list(elements.keys())
+            types = [elements[g].get("type", "") for g in guids]
+            arrays = {"_mtime": np.array(ifc_mtime), "_guids": np.array(guids), "_types": np.array(types)}
+            for i, guid in enumerate(guids):
+                arrays[f"v_{i}"] = elements[guid]["verts"]
+                arrays[f"f_{i}"] = elements[guid]["faces"]
+            np.savez(cache_path, **arrays)
         except Exception:
             pass
 
@@ -1416,20 +1422,21 @@ class FreeIFCWindow(QMainWindow):
 def _make_polydata(verts: np.ndarray, faces: np.ndarray) -> vtkPolyData:
     from vtkmodules.util.numpy_support import numpy_to_vtk, numpy_to_vtkIdTypeArray
 
-    # Points — zero-copy from numpy
     verts_c = np.ascontiguousarray(verts, dtype=np.float64)
     vtk_pts_data = numpy_to_vtk(verts_c, deep=True)
     pts = vtkPoints()
     pts.SetData(vtk_pts_data)
 
-    # Cells — build connectivity array: [3, i0, i1, i2, 3, i0, i1, i2, ...]
     n_tri = len(faces)
-    conn = np.empty((n_tri, 4), dtype=np.int64)
-    conn[:, 0] = 3
-    conn[:, 1:] = faces
-    vtk_cells_data = numpy_to_vtkIdTypeArray(conn.ravel(), deep=True)
+    # Offsets: [0, 3, 6, 9, ...] — each cell has 3 points
+    offsets = np.arange(0, (n_tri + 1) * 3, 3, dtype=np.int64)
+    # Connectivity: [i0, i1, i2, i0, i1, i2, ...] — flat
+    connectivity = np.ascontiguousarray(faces.ravel(), dtype=np.int64)
+
     cells = vtkCellArray()
-    cells.SetCells(n_tri, vtk_cells_data)
+    vtk_offsets = numpy_to_vtkIdTypeArray(offsets, deep=True)
+    vtk_conn = numpy_to_vtkIdTypeArray(connectivity, deep=True)
+    cells.SetData(vtk_offsets, vtk_conn)
 
     pd = vtkPolyData()
     pd.SetPoints(pts)
