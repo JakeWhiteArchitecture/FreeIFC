@@ -34,7 +34,7 @@ from vtkmodules.vtkRenderingCore import (
     vtkActor, vtkPolyDataMapper, vtkRenderer,
 )
 from vtkmodules.vtkRenderingLOD import vtkLODActor
-from vtkmodules.vtkInteractionStyle import vtkInteractorStyle
+from vtkmodules.vtkInteractionStyle import vtkInteractorStyleTrackballCamera
 from vtkmodules.vtkRenderingCore import vtkCellPicker
 from vtkmodules.vtkRenderingAnnotation import vtkAxesActor
 from vtkmodules.vtkInteractionWidgets import vtkOrientationMarkerWidget
@@ -550,9 +550,9 @@ class FreeIFCWindow(QMainWindow):
         self._orientation_widget.SetOrientationMarker(axes)
         self._orientation_widget.SetViewport(0.85, 0.85, 1.0, 1.0)
 
-        # Bare interactor style — we handle all interaction via observers
-        # This prevents the base style from entering its own rotate/zoom modes
-        bare_style = vtkInteractorStyle()
+        # Use trackball camera but we fully override left-button via observers
+        # to prevent the base style's rotate mode from getting stuck
+        bare_style = vtkInteractorStyleTrackballCamera()
 
         iren = self._vtk_widget.GetRenderWindow().GetInteractor()
         iren.SetInteractorStyle(bare_style)
@@ -690,6 +690,9 @@ class FreeIFCWindow(QMainWindow):
 
     def _on_left_release(self, obj, event):
         self._orbiting = False
+        # Ensure the base style exits any mode it might have entered
+        iren = self._vtk_widget.GetRenderWindow().GetInteractor()
+        iren.GetInteractorStyle().OnLeftButtonUp()
 
     def _on_middle_press(self, obj, event):
         iren = self._vtk_widget.GetRenderWindow().GetInteractor()
@@ -698,6 +701,8 @@ class FreeIFCWindow(QMainWindow):
 
     def _on_middle_release(self, obj, event):
         self._panning = False
+        iren = self._vtk_widget.GetRenderWindow().GetInteractor()
+        iren.GetInteractorStyle().OnMiddleButtonUp()
 
     def _on_mouse_move(self, obj, event):
         if not self._orbiting and not self._panning:
