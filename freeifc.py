@@ -326,8 +326,12 @@ class FreeIFCWindow(QMainWindow):
         self._actors: dict[str, vtkLODActor] = {}
         self._edge_actors: dict[str, vtkActor] = {}
         self._outlines: dict[str, vtkActor] = {}
+        self._polydata: dict[str, vtkPolyData] = {}
         self._props: dict[str, dict] = {}
         self._hidden_guids: set[str] = set()
+        self._edge_build_timer = None
+        self._edge_build_queue = []
+        self._edge_build_total = 0
         self._selected_guid: str | None = None
         self._loader: LoaderThread | None = None
         self._loading = False
@@ -942,6 +946,10 @@ class FreeIFCWindow(QMainWindow):
 
     def _clear_scene(self):
         self._deselect()
+        if self._edge_build_timer is not None:
+            self._edge_build_timer.stop()
+            self._edge_build_timer = None
+        self._edge_build_queue = []
         for actor in self._actors.values():
             self.renderer.RemoveActor(actor)
         for actor in self._edge_actors.values():
@@ -951,6 +959,7 @@ class FreeIFCWindow(QMainWindow):
         self._actors.clear()
         self._edge_actors.clear()
         self._outlines.clear()
+        self._polydata.clear()
         self._props.clear()
         self._hidden_guids.clear()
         self._tree.clear()
@@ -970,17 +979,17 @@ class FreeIFCWindow(QMainWindow):
         normals.ComputePointNormalsOn()
         normals.SplittingOff()
         normals.Update()
+        normals_output = normals.GetOutput()
 
         # Scene actor — flat shading, no light source
-        # Use vtkLODActor but disable LOD by default (huge cloud points = never switch)
         mapper = vtkPolyDataMapper()
-        mapper.SetInputData(normals.GetOutput())
+        mapper.SetInputData(normals_output)
         actor = vtkLODActor()
         actor.SetMapper(mapper)
         if self._lod_enabled:
             actor.SetNumberOfCloudPoints(self._lod_cloud_points)
         else:
-            actor.SetNumberOfCloudPoints(999999999)  # effectively disables LOD
+            actor.SetNumberOfCloudPoints(999999999)
         actor.GetProperty().SetColor(*colour)
         actor.GetProperty().SetOpacity(opacity)
         actor.GetProperty().SetAmbient(1.0)
@@ -990,57 +999,12 @@ class FreeIFCWindow(QMainWindow):
         self.renderer.AddActor(actor)
         self._actors[guid] = actor
 
-        # Feature-edge actor — visible by default (lines where forms overlap)
-        fe_edge = vtkFeatureEdges()
-        fe_edge.SetInputData(normals.GetOutput())
-        fe_edge.BoundaryEdgesOn()
-        fe_edge.FeatureEdgesOn()
-        fe_edge.SetFeatureAngle(30)
-        fe_edge.ManifoldEdgesOff()
-        fe_edge.NonManifoldEdgesOff()
-        fe_edge.ColoringOff()
-        fe_edge.Update()
-        edge_mapper = vtkPolyDataMapper()
-        edge_mapper.SetInputConnection(fe_edge.GetOutputPort())
-        edge_actor = vtkActor()
-        edge_actor.SetMapper(edge_mapper)
-        edge_actor.GetProperty().SetColor(0.12, 0.12, 0.14)
-        edge_actor.GetProperty().SetLineWidth(1.0)
-        edge_actor.GetProperty().SetAmbient(1.0)
-        edge_actor.GetProperty().SetDiffuse(0.0)
-        edge_actor.GetProperty().LightingOff()
-        edge_actor.SetPickable(False)
-        edge_actor.SetVisibility(self._edges_visible)
-        self.renderer.AddActor(edge_actor)
-        self._edge_actors[guid] = edge_actor
-
-        # Outline actor — hard edges for selection highlight
-        fe_outline = vtkFeatureEdges()
-        fe_outline.SetInputData(normals.GetOutput())
-        fe_outline.BoundaryEdgesOn()
-        fe_outline.FeatureEdgesOn()
-        fe_outline.SetFeatureAngle(30)
-        fe_outline.ManifoldEdgesOff()
-        fe_outline.NonManifoldEdgesOff()
-        fe_outline.ColoringOff()
-        fe_outline.Update()
-        outline_mapper = vtkPolyDataMapper()
-        outline_mapper.SetInputConnection(fe_outline.GetOutputPort())
-        outline_actor = vtkActor()
-        outline_actor.SetMapper(outline_mapper)
-        outline_actor.GetProperty().SetLineWidth(2.5)
-        outline_actor.GetProperty().SetColor(0.31, 0.76, 0.97)
-        outline_actor.GetProperty().SetAmbient(1.0)
-        outline_actor.GetProperty().SetDiffuse(0.0)
-        outline_actor.GetProperty().LightingOff()
-        outline_actor.SetVisibility(False)
-        outline_actor.SetPickable(False)
-        self.overlay.AddActor(outline_actor)
-        self._outlines[guid] = outline_actor
+        # Store polydata for deferred edge/outline extraction
+        self._polydata[guid] = normals_output
 
         self._props[guid] = props
 
-        if len(self._actors) % 20 == 0:
+        if len(self._actors) % 100 == 0:
             self._vtk_widget.GetRenderWindow().Render()
 
     def _on_load_progress(self, done: int, total: int):
@@ -1052,8 +1016,6 @@ class FreeIFCWindow(QMainWindow):
         self._loading = False
         self._open_btn.setEnabled(True)
         self.setAcceptDrops(True)
-        self._progress.hide()
-        self._progress_label.hide()
 
         self._tree.blockSignals(True)
         self._tree.clear()
@@ -1070,6 +1032,93 @@ class FreeIFCWindow(QMainWindow):
         self.renderer.ResetCamera()
         cam.Dolly(0.85)
         self.renderer.ResetCameraClippingRange()
+        self._vtk_widget.GetRenderWindow().Render()
+
+        # Deferred edge/outline extraction — process in small batches via timer
+        # so the UI stays responsive while edges are being built
+        self._edge_build_queue = list(self._polydata.keys())
+        self._edge_build_total = len(self._edge_build_queue)
+        self._progress.setMaximum(self._edge_build_total)
+        self._progress.setValue(0)
+        self._progress.show()
+        self._progress_label.setText("Building edges…")
+        self._progress_label.show()
+        from PyQt6.QtCore import QTimer
+        self._edge_build_timer = QTimer()
+        self._edge_build_timer.setInterval(0)  # process ASAP between UI events
+        self._edge_build_timer.timeout.connect(self._build_edges_batch)
+        self._edge_build_timer.start()
+
+    def _build_edges_batch(self):
+        """Process a batch of edge/outline actors per timer tick."""
+        BATCH = 20  # elements per tick
+        for _ in range(BATCH):
+            if not self._edge_build_queue:
+                # Done — clean up
+                self._edge_build_timer.stop()
+                self._edge_build_timer = None
+                self._progress.hide()
+                self._progress_label.hide()
+                self._polydata.clear()  # free memory
+                self._vtk_widget.GetRenderWindow().Render()
+                return
+            guid = self._edge_build_queue.pop()
+            normals_output = self._polydata.get(guid)
+            if normals_output is None:
+                continue
+
+            # Feature-edge actor
+            fe_edge = vtkFeatureEdges()
+            fe_edge.SetInputData(normals_output)
+            fe_edge.BoundaryEdgesOn()
+            fe_edge.FeatureEdgesOn()
+            fe_edge.SetFeatureAngle(30)
+            fe_edge.ManifoldEdgesOff()
+            fe_edge.NonManifoldEdgesOff()
+            fe_edge.ColoringOff()
+            fe_edge.Update()
+            edge_mapper = vtkPolyDataMapper()
+            edge_mapper.SetInputConnection(fe_edge.GetOutputPort())
+            edge_actor = vtkActor()
+            edge_actor.SetMapper(edge_mapper)
+            edge_actor.GetProperty().SetColor(0.12, 0.12, 0.14)
+            edge_actor.GetProperty().SetLineWidth(1.0)
+            edge_actor.GetProperty().SetAmbient(1.0)
+            edge_actor.GetProperty().SetDiffuse(0.0)
+            edge_actor.GetProperty().LightingOff()
+            edge_actor.SetPickable(False)
+            visible = self._edges_visible and guid not in self._hidden_guids
+            edge_actor.SetVisibility(visible)
+            self.renderer.AddActor(edge_actor)
+            self._edge_actors[guid] = edge_actor
+
+            # Outline actor — for selection highlight
+            fe_outline = vtkFeatureEdges()
+            fe_outline.SetInputData(normals_output)
+            fe_outline.BoundaryEdgesOn()
+            fe_outline.FeatureEdgesOn()
+            fe_outline.SetFeatureAngle(30)
+            fe_outline.ManifoldEdgesOff()
+            fe_outline.NonManifoldEdgesOff()
+            fe_outline.ColoringOff()
+            fe_outline.Update()
+            outline_mapper = vtkPolyDataMapper()
+            outline_mapper.SetInputConnection(fe_outline.GetOutputPort())
+            outline_actor = vtkActor()
+            outline_actor.SetMapper(outline_mapper)
+            outline_actor.GetProperty().SetLineWidth(2.5)
+            outline_actor.GetProperty().SetColor(0.31, 0.76, 0.97)
+            outline_actor.GetProperty().SetAmbient(1.0)
+            outline_actor.GetProperty().SetDiffuse(0.0)
+            outline_actor.GetProperty().LightingOff()
+            outline_actor.SetVisibility(guid == self._selected_guid)
+            outline_actor.SetPickable(False)
+            self.overlay.AddActor(outline_actor)
+            self._outlines[guid] = outline_actor
+
+        done = self._edge_build_total - len(self._edge_build_queue)
+        self._progress.setValue(done)
+        self._progress_label.setText(f"Building edges… {done} / {self._edge_build_total}")
         self._vtk_widget.GetRenderWindow().Render()
 
     def _populate_tree(self, parent_item, node: dict):
@@ -1166,16 +1215,22 @@ class FreeIFCWindow(QMainWindow):
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 def _make_polydata(verts: np.ndarray, faces: np.ndarray) -> vtkPolyData:
-    pts = vtkPoints()
-    pts.SetNumberOfPoints(len(verts))
-    for i, (x, y, z) in enumerate(verts):
-        pts.SetPoint(i, x, y, z)
+    from vtkmodules.util.numpy_support import numpy_to_vtk, numpy_to_vtkIdTypeArray
 
+    # Points — zero-copy from numpy
+    verts_c = np.ascontiguousarray(verts, dtype=np.float64)
+    vtk_pts_data = numpy_to_vtk(verts_c, deep=True)
+    pts = vtkPoints()
+    pts.SetData(vtk_pts_data)
+
+    # Cells — build connectivity array: [3, i0, i1, i2, 3, i0, i1, i2, ...]
+    n_tri = len(faces)
+    conn = np.empty((n_tri, 4), dtype=np.int64)
+    conn[:, 0] = 3
+    conn[:, 1:] = faces
+    vtk_cells_data = numpy_to_vtkIdTypeArray(conn.ravel(), deep=True)
     cells = vtkCellArray()
-    for tri in faces:
-        cells.InsertNextCell(3)
-        for idx in tri:
-            cells.InsertCellPoint(int(idx))
+    cells.SetCells(n_tri, vtk_cells_data)
 
     pd = vtkPolyData()
     pd.SetPoints(pts)
