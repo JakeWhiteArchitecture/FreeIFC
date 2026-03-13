@@ -98,6 +98,11 @@ class LoaderThread(QThread):
         super().__init__()
         self.path = path
 
+    def _log(self, msg: str):
+        """Emit status update AND print to console for debugging."""
+        print(f"[FreeIFC] {msg}", file=sys.stderr, flush=True)
+        self.status_update.emit(msg)
+
     def run(self):
         cache_path = self.path + ".freeifc.npz"
         ifc_mtime = os.path.getmtime(self.path)
@@ -108,7 +113,7 @@ class LoaderThread(QThread):
                 cache = np.load(cache_path, allow_pickle=True)
                 stored_mtime = float(cache["_mtime"])
                 if stored_mtime >= ifc_mtime:
-                    self.status_update.emit("Loading cached geometry…")
+                    self._log("Loading cached geometry…")
                     guids = list(cache["_guids"])
                     types = list(cache["_types"])
                     elements = {}
@@ -138,17 +143,17 @@ class LoaderThread(QThread):
         # ── Try IfcConvert (fast C++ path) ───────────────────────────
         ifcconvert = shutil.which("IfcConvert") or shutil.which("ifcconvert")
         if ifcconvert:
-            self.status_update.emit(f"Found IfcConvert: {ifcconvert}")
+            self._log(f"Found IfcConvert: {ifcconvert}")
             elements = self._load_via_ifcconvert(ifcconvert)
             if elements:
-                self.status_update.emit(f"IfcConvert: {len(elements)} elements loaded")
+                self._log(f"IfcConvert: {len(elements)} elements loaded")
         else:
-            self.status_update.emit("IfcConvert not on PATH, using Python fallback…")
+            self._log("IfcConvert not on PATH, using Python fallback…")
             elements = None
 
         # ── Fallback: ifcopenshell.geom.iterator ─────────────────────
         if elements is None:
-            self.status_update.emit("Falling back to ifcopenshell tessellation…")
+            self._log("Falling back to ifcopenshell tessellation…")
             elements = self._load_via_iterator()
 
         if elements is None:
@@ -159,7 +164,7 @@ class LoaderThread(QThread):
             return
 
         # ── Load IFC metadata ────────────────────────────────────────
-        self.status_update.emit("Reading IFC metadata…")
+        self._log("Reading IFC metadata…")
         try:
             model = ifcopenshell.open(self.path)
         except Exception as exc:
@@ -177,7 +182,7 @@ class LoaderThread(QThread):
         hierarchy = self._build_hierarchy(model)
 
         # ── Save cache (npz — memory-efficient) ──────────────────────
-        self.status_update.emit("Saving cache…")
+        self._log("Saving cache…")
         try:
             guids = list(elements.keys())
             types = [elements[g].get("type", "") for g in guids]
@@ -196,11 +201,11 @@ class LoaderThread(QThread):
         try:
             import trimesh
         except ImportError:
-            self.status_update.emit("trimesh not installed, using fallback…")
+            self._log("trimesh not installed, using fallback…")
             return None
 
         glb_path = self.path + ".tmp.glb"
-        self.status_update.emit("Converting IFC geometry (IfcConvert)…")
+        self._log("Converting IFC geometry (IfcConvert)…")
         try:
             ncpu = os.cpu_count() or 4
             result = subprocess.run(
@@ -210,25 +215,25 @@ class LoaderThread(QThread):
             )
             if result.returncode != 0:
                 stderr = result.stderr.strip()[:300] if result.stderr else "unknown error"
-                self.status_update.emit(f"IfcConvert failed (code {result.returncode}): {stderr}")
+                self._log(f"IfcConvert failed (code {result.returncode}): {stderr}")
                 return None
         except subprocess.TimeoutExpired:
-            self.status_update.emit("IfcConvert timed out (10 min), using fallback…")
+            self._log("IfcConvert timed out (10 min), using fallback…")
             return None
         except Exception as exc:
-            self.status_update.emit(f"IfcConvert error: {exc}")
+            self._log(f"IfcConvert error: {exc}")
             return None
 
         if not os.path.isfile(glb_path):
-            self.status_update.emit("IfcConvert produced no output file, using fallback…")
+            self._log("IfcConvert produced no output file, using fallback…")
             return None
 
         glb_size = os.path.getsize(glb_path)
-        self.status_update.emit(f"Loading GLB geometry ({glb_size / 1048576:.1f} MB)…")
+        self._log(f"Loading GLB geometry ({glb_size / 1048576:.1f} MB)…")
         try:
             scene = trimesh.load(glb_path, process=False)
         except Exception as exc:
-            self.status_update.emit(f"GLB load failed: {exc}")
+            self._log(f"GLB load failed: {exc}")
             return None
         finally:
             try:
@@ -236,7 +241,7 @@ class LoaderThread(QThread):
             except Exception:
                 pass
 
-        self.status_update.emit("Processing geometry…")
+        self._log("Processing geometry…")
         elements = {}
 
         if isinstance(scene, trimesh.Scene):
@@ -311,7 +316,7 @@ class LoaderThread(QThread):
 
             n_done += 1
             if n_done % 200 == 0:
-                self.status_update.emit(f"Tessellating… {n_done} / {n_total}")
+                self._log(f"Tessellating… {n_done} / {n_total}")
 
             try:
                 if not iterator.next():
