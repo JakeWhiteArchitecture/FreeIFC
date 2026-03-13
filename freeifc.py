@@ -88,7 +88,7 @@ def _opacity_for(ifc_type: str):
     return TYPE_OPACITIES.get(ifc_type, DEFAULT_OPACITY)
 
 
-# ── Loader thread — IfcConvert + trimesh + cache ─────────────────────────────
+# ── Loader thread — IfcConvert (fast) or ifcopenshell fallback + cache ───────
 
 class LoaderThread(QThread):
     status_update = pyqtSignal(str)
@@ -100,8 +100,6 @@ class LoaderThread(QThread):
         self.path = path
 
     def run(self):
-        import trimesh
-
         cache_path = self.path + ".freeifc"
         ifc_mtime = os.path.getmtime(self.path)
 
@@ -113,7 +111,6 @@ class LoaderThread(QThread):
                 if cache.get("mtime", 0) >= ifc_mtime:
                     self.status_update.emit("Loading cached geometry…")
                     elements = cache["elements"]
-                    # Load IFC metadata (fast, no tessellation)
                     model = ifcopenshell.open(self.path)
                     for guid in list(elements.keys()):
                         try:
@@ -128,85 +125,28 @@ class LoaderThread(QThread):
                     self.load_complete.emit({"elements": elements, "hierarchy": hierarchy})
                     return
             except Exception:
-                pass  # Cache invalid, reconvert
-
-        # ── Find IfcConvert ──────────────────────────────────────────
-        ifcconvert = shutil.which("IfcConvert") or shutil.which("ifcconvert")
-        if not ifcconvert:
-            self.load_error.emit(
-                "IfcConvert not found on PATH.\n"
-                "Install with: pip install ifcopenshell\n"
-                "Or download from https://ifcopenshell.org"
-            )
-            return
-
-        # ── Convert IFC → GLB ────────────────────────────────────────
-        glb_path = self.path + ".tmp.glb"
-        self.status_update.emit("Converting IFC geometry (IfcConvert)…")
-        try:
-            ncpu = os.cpu_count() or 4
-            result = subprocess.run(
-                [ifcconvert, "--use-element-guids", "-j", str(ncpu),
-                 self.path, glb_path],
-                capture_output=True, text=True, timeout=600,
-            )
-            if result.returncode != 0:
-                self.load_error.emit(f"IfcConvert failed:\n{result.stderr[:500]}")
-                return
-        except FileNotFoundError:
-            self.load_error.emit("IfcConvert not found.")
-            return
-        except subprocess.TimeoutExpired:
-            self.load_error.emit("IfcConvert timed out (10 min limit).")
-            return
-
-        # ── Load GLB with trimesh ────────────────────────────────────
-        self.status_update.emit("Loading GLB geometry…")
-        try:
-            scene = trimesh.load(glb_path, process=False)
-        except Exception as exc:
-            self.load_error.emit(f"Failed to load GLB:\n{exc}")
-            return
-        finally:
-            try:
-                os.remove(glb_path)
-            except Exception:
                 pass
 
-        # ── Extract per-element meshes ───────────────────────────────
-        self.status_update.emit("Processing geometry…")
-        elements = {}
+        # ── Try IfcConvert (fast C++ path) ───────────────────────────
+        ifcconvert = shutil.which("IfcConvert") or shutil.which("ifcconvert")
+        if ifcconvert:
+            elements = self._load_via_ifcconvert(ifcconvert)
+        else:
+            elements = None
 
-        if isinstance(scene, trimesh.Scene):
-            for node_name in scene.graph.nodes_geometry:
-                try:
-                    T, geom_name = scene.graph[node_name]
-                    mesh = scene.geometry[geom_name]
-                    verts = np.array(mesh.vertices, dtype=np.float64)
-                    if not np.allclose(T, np.eye(4)):
-                        verts = (T[:3, :3] @ verts.T).T + T[:3, 3]
-                    faces = np.array(mesh.faces, dtype=np.int64)
-                    if len(verts) > 0 and len(faces) > 0:
-                        elements[node_name] = {
-                            "verts": verts,
-                            "faces": faces,
-                            "type": "",
-                        }
-                except Exception:
-                    continue
-        elif hasattr(scene, "vertices"):
-            # Single mesh
-            elements["unknown"] = {
-                "verts": np.array(scene.vertices, dtype=np.float64),
-                "faces": np.array(scene.faces, dtype=np.int64),
-                "type": "",
-            }
+        # ── Fallback: ifcopenshell.geom.iterator ─────────────────────
+        if elements is None:
+            self.status_update.emit("Tessellating geometry (Python fallback)…")
+            elements = self._load_via_iterator()
+
+        if elements is None:
+            return  # error already emitted
 
         if not elements:
-            self.load_error.emit("No geometry found after conversion.")
+            self.load_error.emit("No geometry found in IFC file.")
             return
 
-        # ── Load IFC metadata (no tessellation) ─────────────────────
+        # ── Load IFC metadata ────────────────────────────────────────
         self.status_update.emit("Reading IFC metadata…")
         try:
             model = ifcopenshell.open(self.path)
@@ -220,7 +160,7 @@ class LoaderThread(QThread):
                 elements[guid]["type"] = el.is_a()
                 elements[guid]["props"] = self._build_props(el)
             except Exception:
-                elements[guid]["props"] = {"Type": "", "GlobalId": guid}
+                elements[guid].setdefault("props", {"Type": elements[guid].get("type", ""), "GlobalId": guid})
 
         hierarchy = self._build_hierarchy(model)
 
@@ -230,7 +170,7 @@ class LoaderThread(QThread):
             cache_data = {
                 "mtime": ifc_mtime,
                 "elements": {
-                    guid: {"verts": e["verts"], "faces": e["faces"], "type": e["type"]}
+                    guid: {"verts": e["verts"], "faces": e["faces"], "type": e.get("type", "")}
                     for guid, e in elements.items()
                 },
             }
@@ -240,6 +180,123 @@ class LoaderThread(QThread):
             pass
 
         self.load_complete.emit({"elements": elements, "hierarchy": hierarchy})
+
+    def _load_via_ifcconvert(self, ifcconvert: str) -> dict | None:
+        """Fast path: IfcConvert → GLB → trimesh."""
+        try:
+            import trimesh
+        except ImportError:
+            return None  # trimesh not available, use fallback
+
+        glb_path = self.path + ".tmp.glb"
+        self.status_update.emit("Converting IFC geometry (IfcConvert)…")
+        try:
+            ncpu = os.cpu_count() or 4
+            result = subprocess.run(
+                [ifcconvert, "--use-element-guids", "-j", str(ncpu),
+                 self.path, glb_path],
+                capture_output=True, text=True, timeout=600,
+            )
+            if result.returncode != 0:
+                return None  # fall back to iterator
+        except Exception:
+            return None
+
+        self.status_update.emit("Loading GLB geometry…")
+        try:
+            scene = trimesh.load(glb_path, process=False)
+        except Exception:
+            return None
+        finally:
+            try:
+                os.remove(glb_path)
+            except Exception:
+                pass
+
+        self.status_update.emit("Processing geometry…")
+        elements = {}
+
+        if isinstance(scene, trimesh.Scene):
+            for node_name in scene.graph.nodes_geometry:
+                try:
+                    T, geom_name = scene.graph[node_name]
+                    mesh = scene.geometry[geom_name]
+                    verts = np.array(mesh.vertices, dtype=np.float64)
+                    if not np.allclose(T, np.eye(4)):
+                        verts = (T[:3, :3] @ verts.T).T + T[:3, 3]
+                    faces = np.array(mesh.faces, dtype=np.int64)
+                    if len(verts) > 0 and len(faces) > 0:
+                        elements[node_name] = {"verts": verts, "faces": faces, "type": ""}
+                except Exception:
+                    continue
+        elif hasattr(scene, "vertices"):
+            elements["unknown"] = {
+                "verts": np.array(scene.vertices, dtype=np.float64),
+                "faces": np.array(scene.faces, dtype=np.int64),
+                "type": "",
+            }
+
+        return elements if elements else None
+
+    def _load_via_iterator(self) -> dict | None:
+        """Fallback: ifcopenshell.geom.iterator (slower but always works)."""
+        import ifcopenshell.geom
+
+        try:
+            model = ifcopenshell.open(self.path)
+        except Exception as exc:
+            self.load_error.emit(f"Failed to open IFC file:\n{exc}")
+            return None
+
+        settings = ifcopenshell.geom.settings()
+        try:
+            settings.set("use-world-coords", True)
+            settings.set("weld-vertices", True)
+        except Exception:
+            try:
+                settings.set(settings.USE_WORLD_COORDS, True)
+                settings.set(settings.WELD_VERTICES, True)
+            except Exception:
+                pass
+
+        try:
+            iterator = ifcopenshell.geom.iterator(settings, model, multiprocessing=True)
+        except Exception:
+            iterator = ifcopenshell.geom.iterator(settings, model)
+
+        try:
+            if not iterator.initialize():
+                self.load_error.emit("No geometry found in IFC file.")
+                return None
+        except Exception as exc:
+            self.load_error.emit(f"Geometry iterator failed:\n{exc}")
+            return None
+
+        elements = {}
+        n_done = 0
+        n_total = len(model.by_type("IfcProduct"))
+
+        while True:
+            try:
+                shape = iterator.get()
+                verts = np.array(shape.geometry.verts, dtype=np.float64).reshape(-1, 3)
+                faces = np.array(shape.geometry.faces, dtype=np.int64).reshape(-1, 3)
+                if len(verts) > 0 and len(faces) > 0:
+                    elements[shape.guid] = {"verts": verts, "faces": faces, "type": ""}
+            except Exception:
+                pass
+
+            n_done += 1
+            if n_done % 200 == 0:
+                self.status_update.emit(f"Tessellating… {n_done} / {n_total}")
+
+            try:
+                if not iterator.next():
+                    break
+            except Exception:
+                break
+
+        return elements
 
     def _build_props(self, element):
         props = {
