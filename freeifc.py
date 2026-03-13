@@ -27,12 +27,12 @@ import vtkmodules.vtkInteractionStyle  # noqa: F401 — registers styles
 import vtkmodules.vtkRenderingOpenGL2  # noqa: F401 — registers OpenGL backend
 from vtkmodules.vtkCommonCore import vtkPoints
 from vtkmodules.vtkCommonDataModel import vtkCellArray, vtkPolyData
-from vtkmodules.vtkFiltersCore import vtkPolyDataNormals
+from vtkmodules.vtkFiltersCore import vtkFeatureEdges, vtkPolyDataNormals
 from vtkmodules.vtkRenderingCore import (
     vtkActor, vtkPolyDataMapper, vtkRenderer,
 )
 from vtkmodules.vtkRenderingLOD import vtkLODActor
-from vtkmodules.vtkInteractionStyle import vtkInteractorStyleTrackballCamera
+from vtkmodules.vtkInteractionStyle import vtkInteractorStyleTerrain
 from vtkmodules.vtkRenderingCore import vtkCellPicker
 
 from vtkmodules.qt.QVTKRenderWindowInteractor import QVTKRenderWindowInteractor
@@ -394,8 +394,18 @@ class FreeIFCWindow(QMainWindow):
         self._grid_actor = _make_grid_actor()
         self.renderer.AddActor(self._grid_actor)
 
-        # Interaction style
-        style = vtkInteractorStyleTrackballCamera()
+        # SSAO pass for ambient occlusion on layer 0
+        from vtkmodules.vtkRenderingOpenGL2 import vtkSSAOPass, vtkRenderStepsPass
+        ssao = vtkSSAOPass()
+        ssao.SetRadius(0.5)
+        ssao.SetKernelSize(128)
+        ssao.BlurOn()
+        basic_passes = vtkRenderStepsPass()
+        ssao.SetDelegatePass(basic_passes)
+        self.renderer.SetPass(ssao)
+
+        # Interaction style — terrain locks up-vector to prevent flipping
+        style = vtkInteractorStyleTerrain()
         self._vtk_widget.GetRenderWindow().GetInteractor().SetInteractorStyle(style)
 
         # Picker
@@ -508,19 +518,28 @@ class FreeIFCWindow(QMainWindow):
         mapper.SetInputData(normals.GetOutput())
         actor = vtkLODActor()
         actor.SetMapper(mapper)
+        actor.SetNumberOfCloudPoints(5000000)
         actor.GetProperty().SetColor(*colour)
         actor.GetProperty().SetOpacity(opacity)
         actor.GetProperty().SetInterpolationToPhong()
         self.renderer.AddActor(actor)
         self._actors[guid] = actor
 
-        # Outline actor (standard, hidden by default)
+        # Outline actor — hard edges only via feature edges filter
+        fe = vtkFeatureEdges()
+        fe.SetInputData(normals.GetOutput())
+        fe.BoundaryEdgesOn()
+        fe.FeatureEdgesOn()
+        fe.SetFeatureAngle(30)
+        fe.ManifoldEdgesOff()
+        fe.NonManifoldEdgesOff()
+        fe.ColoringOff()
+        fe.Update()
         outline_mapper = vtkPolyDataMapper()
-        outline_mapper.SetInputData(normals.GetOutput())
+        outline_mapper.SetInputConnection(fe.GetOutputPort())
         outline_actor = vtkActor()
         outline_actor.SetMapper(outline_mapper)
-        outline_actor.GetProperty().SetRepresentationToWireframe()
-        outline_actor.GetProperty().SetLineWidth(2.0)
+        outline_actor.GetProperty().SetLineWidth(2.5)
         outline_actor.GetProperty().SetColor(0.31, 0.76, 0.97)
         outline_actor.GetProperty().SetAmbient(1.0)
         outline_actor.GetProperty().SetDiffuse(0.0)
