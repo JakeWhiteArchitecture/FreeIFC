@@ -103,15 +103,31 @@ class LoaderThread(QThread):
 
         # Geometry iterator settings
         settings = ifcopenshell.geom.settings()
-        settings.set("use-world-coords", True)
-        settings.set("weld-vertices", True)
+        try:
+            settings.set("use-world-coords", True)
+            settings.set("weld-vertices", True)
+        except Exception:
+            # ifcopenshell 0.8+ uses enum-based settings
+            try:
+                settings.set(settings.USE_WORLD_COORDS, True)
+                settings.set(settings.WELD_VERTICES, True)
+            except Exception:
+                pass
 
-        iterator = ifcopenshell.geom.iterator(
-            settings, model, multiprocessing=True,
-        )
+        try:
+            iterator = ifcopenshell.geom.iterator(
+                settings, model, multiprocessing=True,
+            )
+        except Exception:
+            # Fall back without multiprocessing if it fails
+            iterator = ifcopenshell.geom.iterator(settings, model)
 
-        if not iterator.initialize():
-            self.load_error.emit("No geometry found in IFC file.")
+        try:
+            if not iterator.initialize():
+                self.load_error.emit("No geometry found in IFC file.")
+                return
+        except Exception as exc:
+            self.load_error.emit(f"Geometry iterator failed to initialize:\n{exc}")
             return
 
         n_done = 0
@@ -120,43 +136,36 @@ class LoaderThread(QThread):
         n_total = len(all_products)
 
         while True:
-            shape = iterator.get()
-            element = model.by_guid(shape.guid)
-            ifc_type = element.is_a()
-
             try:
+                shape = iterator.get()
+                element = model.by_guid(shape.guid)
+                ifc_type = element.is_a()
+
                 verts = np.array(shape.geometry.verts, dtype=np.float64).reshape(-1, 3)
                 faces = np.array(shape.geometry.faces, dtype=np.int64).reshape(-1, 3)
+
+                if len(verts) > 0 and len(faces) > 0:
+                    props = {
+                        "Type": ifc_type,
+                        "Name": getattr(element, "Name", None) or "",
+                        "GlobalId": shape.guid,
+                    }
+                    for attr in ("Description", "ObjectType", "Tag"):
+                        val = getattr(element, attr, None)
+                        if val:
+                            props[attr] = val
+
+                    self.element_ready.emit(shape.guid, verts, faces, props)
             except Exception:
-                n_done += 1
-                self.load_progress.emit(n_done, n_total)
-                if not iterator.next():
-                    break
-                continue
-
-            if len(verts) == 0 or len(faces) == 0:
-                n_done += 1
-                self.load_progress.emit(n_done, n_total)
-                if not iterator.next():
-                    break
-                continue
-
-            props = {
-                "Type": ifc_type,
-                "Name": getattr(element, "Name", None) or "",
-                "GlobalId": shape.guid,
-            }
-            for attr in ("Description", "ObjectType", "Tag"):
-                val = getattr(element, attr, None)
-                if val:
-                    props[attr] = val
-
-            self.element_ready.emit(shape.guid, verts, faces, props)
+                pass
 
             n_done += 1
             self.load_progress.emit(n_done, n_total)
 
-            if not iterator.next():
+            try:
+                if not iterator.next():
+                    break
+            except Exception:
                 break
 
         # Build storey map
