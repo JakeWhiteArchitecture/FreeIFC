@@ -573,7 +573,8 @@ class FreeIFCWindow(QMainWindow):
         iren.AddObserver("MiddleButtonPressEvent", self._on_middle_press)
         iren.AddObserver("MiddleButtonReleaseEvent", self._on_middle_release)
         iren.AddObserver("MouseMoveEvent", self._on_mouse_move)
-        iren.AddObserver("RightButtonPressEvent", self._on_right_click)
+        iren.AddObserver("RightButtonPressEvent", self._on_right_press)
+        iren.AddObserver("RightButtonReleaseEvent", self._on_right_release)
         iren.AddObserver("MouseWheelForwardEvent", self._on_wheel_forward)
         iren.AddObserver("MouseWheelBackwardEvent", self._on_wheel_backward)
 
@@ -664,6 +665,7 @@ class FreeIFCWindow(QMainWindow):
     # ── Custom orbit (Z-axis azimuth) ────────────────────────────────────
 
     def _on_left_press(self, obj, event):
+        """Left-click: selection only (no orbit drag)."""
         iren = self._vtk_widget.GetRenderWindow().GetInteractor()
         click_pos = iren.GetEventPosition()
 
@@ -683,24 +685,35 @@ class FreeIFCWindow(QMainWindow):
                 else:
                     self._select(guid)
                 self._vtk_widget.GetRenderWindow().Render()
-                # Don't start orbit when clicking on an element
                 return
         else:
             if self._selected_guid is not None:
                 self._deselect()
                 self._vtk_widget.GetRenderWindow().Render()
 
-        # Start orbit
-        self._orbiting = True
-        self._last_mouse_pos = click_pos
-
     def _on_left_release(self, obj, event):
-        self._orbiting = False
+        pass
 
     def _on_middle_press(self, obj, event):
+        """Middle-click: pan, or show context menu if clicking an element."""
         iren = self._vtk_widget.GetRenderWindow().GetInteractor()
+        click_pos = iren.GetEventPosition()
+
+        # Check if clicking on an element — show hide context menu
+        self._picker.Pick(click_pos[0], click_pos[1], 0, self.renderer)
+        picked_actor = self._picker.GetActor()
+        if picked_actor is not None and picked_actor is not self._grid_actor:
+            guid = None
+            for g, a in self._actors.items():
+                if a is picked_actor:
+                    guid = g
+                    break
+            if guid is not None:
+                self._show_hide_menu(guid, click_pos)
+                return
+
         self._panning = True
-        self._last_mouse_pos = iren.GetEventPosition()
+        self._last_mouse_pos = click_pos
 
     def _on_middle_release(self, obj, event):
         self._panning = False
@@ -800,28 +813,20 @@ class FreeIFCWindow(QMainWindow):
             child.setCheckState(0, Qt.CheckState.Checked)
             self._reset_tree_checks(child)
 
-    # ── Right-click context menu ─────────────────────────────────────────
+    # ── Right-click = orbit drag ─────────────────────────────────────────
 
-    def _on_right_click(self, obj, event):
+    def _on_right_press(self, obj, event):
+        """Right-drag: orbit."""
         iren = self._vtk_widget.GetRenderWindow().GetInteractor()
-        click_pos = iren.GetEventPosition()
-        self._picker.Pick(click_pos[0], click_pos[1], 0, self.renderer)
-        picked_actor = self._picker.GetActor()
+        self._orbiting = True
+        self._last_mouse_pos = iren.GetEventPosition()
 
-        if picked_actor is None or picked_actor is self._grid_actor:
-            iren.GetInteractorStyle().OnRightButtonDown()
-            return
+    def _on_right_release(self, obj, event):
+        self._orbiting = False
 
-        guid = None
-        for g, a in self._actors.items():
-            if a is picked_actor:
-                guid = g
-                break
+    # ── Context menu (middle-click on element) ────────────────────────────
 
-        if guid is None:
-            iren.GetInteractorStyle().OnRightButtonDown()
-            return
-
+    def _show_hide_menu(self, guid: str, click_pos):
         menu = QMenu(self)
         menu.setStyleSheet("""
             QMenu { background: #2d2e33; color: #d4d4d4; border: 1px solid #3a3b40; }
