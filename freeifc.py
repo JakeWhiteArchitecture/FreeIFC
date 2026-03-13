@@ -18,7 +18,7 @@ import ifcopenshell.geom
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QCheckBox, QFileDialog, QScrollArea,
-    QSizePolicy, QFrame, QProgressBar,
+    QSizePolicy, QFrame, QProgressBar, QTreeWidget, QTreeWidgetItem,
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QMimeData
 from PyQt6.QtGui import QDragEnterEvent, QDropEvent
@@ -34,6 +34,8 @@ from vtkmodules.vtkRenderingCore import (
 from vtkmodules.vtkRenderingLOD import vtkLODActor
 from vtkmodules.vtkInteractionStyle import vtkInteractorStyleTerrain
 from vtkmodules.vtkRenderingCore import vtkCellPicker
+from vtkmodules.vtkRenderingAnnotation import vtkAnnotatedCubeActor
+from vtkmodules.vtkInteractionWidgets import vtkOrientationMarkerWidget
 
 from vtkmodules.qt.QVTKRenderWindowInteractor import QVTKRenderWindowInteractor
 
@@ -81,13 +83,13 @@ class LoaderThread(QThread):
     Signals emitted back to the main thread:
         element_ready  — one element tessellated (guid, verts, faces, props)
         load_progress  — (n_done, n_total)
-        load_complete  — {storey_name: [guid, …], …}
+        load_complete  — hierarchy dict
         load_error     — str error message
     """
 
     element_ready = pyqtSignal(str, object, object, dict)   # guid, verts, faces, props
     load_progress = pyqtSignal(int, int)                     # done, total
-    load_complete = pyqtSignal(dict)                         # storey_map
+    load_complete = pyqtSignal(dict)                         # hierarchy
     load_error    = pyqtSignal(str)
 
     def __init__(self, path: str):
@@ -107,7 +109,6 @@ class LoaderThread(QThread):
             settings.set("use-world-coords", True)
             settings.set("weld-vertices", True)
         except Exception:
-            # ifcopenshell 0.8+ uses enum-based settings
             try:
                 settings.set(settings.USE_WORLD_COORDS, True)
                 settings.set(settings.WELD_VERTICES, True)
@@ -119,7 +120,6 @@ class LoaderThread(QThread):
                 settings, model, multiprocessing=True,
             )
         except Exception:
-            # Fall back without multiprocessing if it fails
             iterator = ifcopenshell.geom.iterator(settings, model)
 
         try:
@@ -131,7 +131,6 @@ class LoaderThread(QThread):
             return
 
         n_done = 0
-        # Count total products with representations for progress
         all_products = model.by_type("IfcProduct")
         n_total = len(all_products)
 
@@ -168,29 +167,74 @@ class LoaderThread(QThread):
             except Exception:
                 break
 
-        # Build storey map
-        storey_map: dict[str, list[str]] = {}
-        assigned_guids: set[str] = set()
+        # Build hierarchy: Project > Site > Building > Storey > elements
+        hierarchy = self._build_hierarchy(model)
+        self.load_complete.emit(hierarchy)
 
-        for storey in model.by_type("IfcBuildingStorey"):
-            name = storey.Name or f"Storey {storey.GlobalId[:8]}"
-            guids: list[str] = []
-            for rel in getattr(storey, "ContainsElements", []):
+    def _build_hierarchy(self, model):
+        """Build a nested dict representing the IFC spatial structure.
+
+        Returns: {
+            "label": "ProjectName",
+            "type": "IfcProject",
+            "children": [
+                {
+                    "label": "SiteName",
+                    "type": "IfcSite",
+                    "children": [
+                        {
+                            "label": "BuildingName",
+                            "type": "IfcBuilding",
+                            "children": [
+                                {
+                                    "label": "StoreyName",
+                                    "type": "IfcBuildingStorey",
+                                    "guids": [guid, ...],
+                                    "children": []
+                                }, ...
+                            ]
+                        }, ...
+                    ]
+                }, ...
+            ]
+        }
+        """
+        def get_children(parent):
+            """Get spatial children via IfcRelAggregates."""
+            children = []
+            for rel in getattr(parent, "IsDecomposedBy", []):
+                for child in rel.RelatedObjects:
+                    children.append(child)
+            return children
+
+        def get_contained_guids(spatial_element):
+            """Get GlobalIds of elements contained in a spatial element."""
+            guids = []
+            for rel in getattr(spatial_element, "ContainsElements", []):
                 for el in rel.RelatedElements:
                     guids.append(el.GlobalId)
-                    assigned_guids.add(el.GlobalId)
-            storey_map[name] = guids
+            return guids
 
-        # Collect unassigned elements
-        unassigned: list[str] = []
-        for product in all_products:
-            if product.GlobalId not in assigned_guids:
-                # Only include elements that actually had geometry
-                unassigned.append(product.GlobalId)
-        if unassigned:
-            storey_map["(Unassigned)"] = unassigned
+        def build_node(element):
+            name = getattr(element, "Name", None) or element.is_a()
+            node = {
+                "label": f"{name} [{element.is_a()}]",
+                "type": element.is_a(),
+                "guids": get_contained_guids(element),
+                "children": [],
+            }
+            for child in get_children(element):
+                node["children"].append(build_node(child))
+            return node
 
-        self.load_complete.emit(storey_map)
+        # Start from IfcProject
+        projects = model.by_type("IfcProject")
+        if projects:
+            root = build_node(projects[0])
+        else:
+            root = {"label": "(No Project)", "type": "", "guids": [], "children": []}
+
+        return root
 
 
 # ── Ground plane grid ────────────────────────────────────────────────────────
@@ -245,14 +289,20 @@ class FreeIFCWindow(QMainWindow):
         open_action.setShortcut("Ctrl+O")
         open_action.triggered.connect(self._on_open_clicked)
 
+        view_menu = menu_bar.addMenu("View")
+        self._edge_action = view_menu.addAction("Show Edges")
+        self._edge_action.setCheckable(True)
+        self._edge_action.setChecked(False)
+        self._edge_action.triggered.connect(self._on_toggle_edges)
+
         # State
         self._actors: dict[str, vtkLODActor] = {}       # guid → scene actor
         self._outlines: dict[str, vtkActor] = {}         # guid → outline actor
         self._props: dict[str, dict] = {}                # guid → property dict
-        self._storey_map: dict[str, list[str]] = {}
         self._selected_guid: str | None = None
         self._loader: LoaderThread | None = None
         self._loading = False
+        self._edges_visible = False
 
         # ── Layout ───────────────────────────────────────────────────────
         central = QWidget()
@@ -277,8 +327,17 @@ class FreeIFCWindow(QMainWindow):
             QPushButton:hover { background: #3a3b40; }
             QPushButton:disabled { color: #666; }
             QLabel { font-size: 12px; }
-            QCheckBox { font-size: 12px; spacing: 6px; }
-            QCheckBox::indicator { width: 14px; height: 14px; }
+            QTreeWidget {
+                background: #1e1f23; color: #d4d4d4; border: none;
+                font-size: 12px; font-family: monospace;
+            }
+            QTreeWidget::item { padding: 2px 0; }
+            QTreeWidget::item:selected { background: #2d2e33; }
+            QTreeWidget::branch { background: #1e1f23; }
+            QHeaderView::section {
+                background: #1e1f23; color: #888; border: none;
+                font-size: 11px; font-weight: bold; padding: 4px;
+            }
         """)
         side_layout = QVBoxLayout(side)
         side_layout.setContentsMargins(12, 12, 12, 12)
@@ -326,23 +385,13 @@ class FreeIFCWindow(QMainWindow):
         sep2.setStyleSheet("color: #3a3b40;")
         side_layout.addWidget(sep2)
 
-        # Storeys header
-        storeys_header = QLabel("STOREYS")
-        storeys_header.setStyleSheet("font-weight: bold; font-size: 11px; color: #888;")
-        side_layout.addWidget(storeys_header)
-
-        # Scrollable storey list
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.Shape.NoFrame)
-        scroll.setStyleSheet("QScrollArea { border: none; }")
-        self._storey_container = QWidget()
-        self._storey_layout = QVBoxLayout(self._storey_container)
-        self._storey_layout.setContentsMargins(0, 0, 0, 0)
-        self._storey_layout.setSpacing(4)
-        self._storey_layout.addStretch()
-        scroll.setWidget(self._storey_container)
-        side_layout.addWidget(scroll, stretch=1)
+        # Model tree
+        self._tree = QTreeWidget()
+        self._tree.setHeaderLabel("MODEL")
+        self._tree.setAnimated(True)
+        self._tree.setIndentation(16)
+        self._tree.itemChanged.connect(self._on_tree_item_changed)
+        side_layout.addWidget(self._tree, stretch=1)
 
         main_layout.addWidget(side)
 
@@ -371,41 +420,35 @@ class FreeIFCWindow(QMainWindow):
         # Share camera
         self.overlay.SetActiveCamera(self.renderer.GetActiveCamera())
 
-        # Lights — key + fill
-        self.renderer.RemoveAllLights()
-        self.renderer.CreateLight()
-        from vtkmodules.vtkRenderingCore import vtkLight
-        key = vtkLight()
-        key.SetLightTypeToSceneLight()
-        key.SetPosition(5, 5, 10)
-        key.SetFocalPoint(0, 0, 0)
-        key.SetIntensity(0.9)
-        key.SetColor(1.0, 0.98, 0.95)
-        self.renderer.AddLight(key)
-        fill = vtkLight()
-        fill.SetLightTypeToSceneLight()
-        fill.SetPosition(-3, -6, 4)
-        fill.SetFocalPoint(0, 0, 0)
-        fill.SetIntensity(0.45)
-        fill.SetColor(0.85, 0.90, 1.0)
-        self.renderer.AddLight(fill)
+        # No lights — flat shading only (ambient = 1, diffuse = 0)
 
         # Ground grid
         self._grid_actor = _make_grid_actor()
         self.renderer.AddActor(self._grid_actor)
 
-        # SSAO pass for ambient occlusion on layer 0
-        from vtkmodules.vtkRenderingOpenGL2 import vtkSSAOPass, vtkRenderStepsPass
-        ssao = vtkSSAOPass()
-        ssao.SetRadius(0.5)
-        ssao.SetKernelSize(128)
-        ssao.BlurOn()
-        basic_passes = vtkRenderStepsPass()
-        ssao.SetDelegatePass(basic_passes)
-        self.renderer.SetPass(ssao)
+        # Navigation cube
+        cube = vtkAnnotatedCubeActor()
+        cube.SetXPlusFaceText("E")
+        cube.SetXMinusFaceText("W")
+        cube.SetYPlusFaceText("N")
+        cube.SetYMinusFaceText("S")
+        cube.SetZPlusFaceText("Top")
+        cube.SetZMinusFaceText("Bot")
+        cube.GetTextEdgesProperty().SetColor(0.18, 0.18, 0.18)
+        cube.GetTextEdgesProperty().SetLineWidth(1)
+        cube.GetCubeProperty().SetColor(0.24, 0.25, 0.28)
+        for face_prop in (
+            cube.GetXPlusFaceProperty(), cube.GetXMinusFaceProperty(),
+            cube.GetYPlusFaceProperty(), cube.GetYMinusFaceProperty(),
+            cube.GetZPlusFaceProperty(), cube.GetZMinusFaceProperty(),
+        ):
+            face_prop.SetColor(0.24, 0.25, 0.28)
+
+        self._orientation_widget = vtkOrientationMarkerWidget()
+        self._orientation_widget.SetOrientationMarker(cube)
+        self._orientation_widget.SetViewport(0.85, 0.0, 1.0, 0.15)
 
         # Interaction style — terrain locks up-vector to prevent flipping
-        # Subclass adds scroll-wheel zoom which vtkInteractorStyleTerrain lacks
         style = vtkInteractorStyleTerrain()
 
         def _wheel_forward(obj, event):
@@ -422,23 +465,40 @@ class FreeIFCWindow(QMainWindow):
 
         style.AddObserver("MouseWheelForwardEvent", _wheel_forward)
         style.AddObserver("MouseWheelBackwardEvent", _wheel_backward)
-        self._vtk_widget.GetRenderWindow().GetInteractor().SetInteractorStyle(style)
+
+        iren = self._vtk_widget.GetRenderWindow().GetInteractor()
+        iren.SetInteractorStyle(style)
 
         # Picker
         self._picker = vtkCellPicker()
         self._picker.SetTolerance(0.005)
 
         # Connect left-click for selection
-        iren = self._vtk_widget.GetRenderWindow().GetInteractor()
         iren.AddObserver("LeftButtonPressEvent", self._on_left_click)
 
         # Start interactor
         self._vtk_widget.Initialize()
         self._vtk_widget.Start()
 
+        # Enable orientation widget after interactor is started
+        self._orientation_widget.SetInteractor(iren)
+        self._orientation_widget.EnabledOn()
+        self._orientation_widget.InteractiveOff()
+
         # Load initial file if provided
         if initial_file and os.path.isfile(initial_file):
             self._load_file(initial_file)
+
+    # ── Edge toggle ──────────────────────────────────────────────────────
+
+    def _on_toggle_edges(self, checked: bool):
+        self._edges_visible = checked
+        for actor in self._actors.values():
+            actor.GetProperty().SetEdgeVisibility(checked)
+            if checked:
+                actor.GetProperty().SetEdgeColor(0.12, 0.12, 0.14)
+                actor.GetProperty().SetLineWidth(1.0)
+        self._vtk_widget.GetRenderWindow().Render()
 
     # ── Drag and drop ────────────────────────────────────────────────────
 
@@ -503,13 +563,7 @@ class FreeIFCWindow(QMainWindow):
         self._actors.clear()
         self._outlines.clear()
         self._props.clear()
-        self._storey_map.clear()
-        # Clear storey checkboxes
-        while self._storey_layout.count() > 1:
-            item = self._storey_layout.takeAt(0)
-            w = item.widget()
-            if w:
-                w.deleteLater()
+        self._tree.clear()
         self._vtk_widget.GetRenderWindow().Render()
 
     # ── Loader signals ───────────────────────────────────────────────────
@@ -522,14 +576,14 @@ class FreeIFCWindow(QMainWindow):
         # Build vtkPolyData
         polydata = _make_polydata(verts, faces)
 
-        # Normals
+        # Normals (needed for feature edges even with flat shading)
         normals = vtkPolyDataNormals()
         normals.SetInputData(polydata)
         normals.ComputePointNormalsOn()
         normals.SplittingOff()
         normals.Update()
 
-        # Scene actor (LOD)
+        # Scene actor (LOD) — flat shading, no light source
         mapper = vtkPolyDataMapper()
         mapper.SetInputData(normals.GetOutput())
         actor = vtkLODActor()
@@ -537,7 +591,14 @@ class FreeIFCWindow(QMainWindow):
         actor.SetNumberOfCloudPoints(5000000)
         actor.GetProperty().SetColor(*colour)
         actor.GetProperty().SetOpacity(opacity)
-        actor.GetProperty().SetInterpolationToPhong()
+        actor.GetProperty().SetAmbient(1.0)
+        actor.GetProperty().SetDiffuse(0.0)
+        actor.GetProperty().LightingOff()
+        actor.GetProperty().SetInterpolationToFlat()
+        if self._edges_visible:
+            actor.GetProperty().SetEdgeVisibility(True)
+            actor.GetProperty().SetEdgeColor(0.12, 0.12, 0.14)
+            actor.GetProperty().SetLineWidth(1.0)
         self.renderer.AddActor(actor)
         self._actors[guid] = actor
 
@@ -576,33 +637,69 @@ class FreeIFCWindow(QMainWindow):
         self._progress.setValue(done)
         self._progress_label.setText(f"Loaded {done} / {total} elements")
 
-    def _on_load_complete(self, storey_map: dict):
-        self._storey_map = storey_map
+    def _on_load_complete(self, hierarchy: dict):
         self._loading = False
         self._open_btn.setEnabled(True)
         self.setAcceptDrops(True)
         self._progress.hide()
         self._progress_label.hide()
 
-        # Build storey checkboxes
-        while self._storey_layout.count() > 1:
-            item = self._storey_layout.takeAt(0)
-            w = item.widget()
-            if w:
-                w.deleteLater()
+        # Build tree widget from hierarchy
+        self._tree.blockSignals(True)
+        self._tree.clear()
+        self._populate_tree(None, hierarchy)
+        self._tree.expandToDepth(1)
+        self._tree.blockSignals(False)
 
-        for name in storey_map:
-            cb = QCheckBox(name)
-            cb.setChecked(True)
-            cb.stateChanged.connect(lambda state, n=name: self._on_storey_toggled(n, state))
-            self._storey_layout.insertWidget(self._storey_layout.count() - 1, cb)
-
-        # Reset camera
+        # Auto-zoom: reset camera to fit all geometry
         self.renderer.ResetCamera()
         cam = self.renderer.GetActiveCamera()
         cam.Dolly(0.85)
         self.renderer.ResetCameraClippingRange()
         self._vtk_widget.GetRenderWindow().Render()
+
+    def _populate_tree(self, parent_item, node: dict):
+        """Recursively build QTreeWidget items from hierarchy dict."""
+        if parent_item is None:
+            item = QTreeWidgetItem(self._tree)
+        else:
+            item = QTreeWidgetItem(parent_item)
+
+        item.setText(0, node["label"])
+        item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsAutoTristate)
+        item.setCheckState(0, Qt.CheckState.Checked)
+
+        # Store guids on the item for visibility toggling
+        guids = node.get("guids", [])
+        item.setData(0, Qt.ItemDataRole.UserRole, guids)
+
+        for child in node.get("children", []):
+            self._populate_tree(item, child)
+
+    def _on_tree_item_changed(self, item: QTreeWidgetItem, column: int):
+        """Toggle visibility of elements when tree checkboxes change."""
+        visible = item.checkState(0) != Qt.CheckState.Unchecked
+        self._set_subtree_visibility(item, visible)
+        self._vtk_widget.GetRenderWindow().Render()
+
+    def _set_subtree_visibility(self, item: QTreeWidgetItem, visible: bool):
+        """Set visibility for all guids under this item and its children."""
+        guids = item.data(0, Qt.ItemDataRole.UserRole) or []
+        for guid in guids:
+            actor = self._actors.get(guid)
+            if actor:
+                actor.SetVisibility(visible)
+            outline = self._outlines.get(guid)
+            if outline and not visible:
+                outline.SetVisibility(False)
+            # If selected element is being hidden, deselect
+            if not visible and guid == self._selected_guid:
+                self._deselect()
+
+        for i in range(item.childCount()):
+            child = item.child(i)
+            child_visible = child.checkState(0) != Qt.CheckState.Unchecked
+            self._set_subtree_visibility(child, child_visible if visible else False)
 
     def _on_load_error(self, msg: str):
         self._loading = False
@@ -612,35 +709,15 @@ class FreeIFCWindow(QMainWindow):
         self._progress_label.setText(msg)
         self._progress_label.show()
 
-    # ── Storey visibility ────────────────────────────────────────────────
-
-    def _on_storey_toggled(self, storey_name: str, state: int):
-        visible = state == Qt.CheckState.Checked.value
-        guids = self._storey_map.get(storey_name, [])
-        for guid in guids:
-            actor = self._actors.get(guid)
-            if actor:
-                actor.SetVisibility(visible)
-            outline = self._outlines.get(guid)
-            if outline:
-                if not visible:
-                    outline.SetVisibility(False)
-        # If selected element is hidden, deselect
-        if not visible and self._selected_guid in guids:
-            self._deselect()
-        self._vtk_widget.GetRenderWindow().Render()
-
     # ── Selection ────────────────────────────────────────────────────────
 
     def _on_left_click(self, obj, event):
-        # Forward to default handler first
         iren = self._vtk_widget.GetRenderWindow().GetInteractor()
         click_pos = iren.GetEventPosition()
         self._picker.Pick(click_pos[0], click_pos[1], 0, self.renderer)
         picked_actor = self._picker.GetActor()
 
         if picked_actor is None or picked_actor is self._grid_actor:
-            # Clicked empty space or grid — deselect
             self._deselect()
             self._vtk_widget.GetRenderWindow().Render()
             iren.GetInteractorStyle().OnLeftButtonDown()
@@ -658,7 +735,6 @@ class FreeIFCWindow(QMainWindow):
             return
 
         if guid == self._selected_guid:
-            # Click same element — toggle off
             self._deselect()
         else:
             self._select(guid)
@@ -667,7 +743,6 @@ class FreeIFCWindow(QMainWindow):
         iren.GetInteractorStyle().OnLeftButtonDown()
 
     def _select(self, guid: str):
-        # Deselect previous
         self._deselect()
 
         self._selected_guid = guid
@@ -676,7 +751,8 @@ class FreeIFCWindow(QMainWindow):
             prop = actor.GetProperty()
             new_opacity = min(1.0, prop.GetOpacity() + 0.18)
             prop.SetOpacity(new_opacity)
-            prop.SetAmbient(0.4)
+            # Brighten slightly for selection feedback on flat shading
+            prop.SetAmbient(1.0)
 
         outline = self._outlines.get(guid)
         if outline:
@@ -699,7 +775,7 @@ class FreeIFCWindow(QMainWindow):
         if actor:
             ifc_type = self._props.get(guid, {}).get("Type", "")
             actor.GetProperty().SetOpacity(_opacity_for(ifc_type))
-            actor.GetProperty().SetAmbient(0.0)
+            actor.GetProperty().SetAmbient(1.0)
 
         outline = self._outlines.get(guid)
         if outline:
