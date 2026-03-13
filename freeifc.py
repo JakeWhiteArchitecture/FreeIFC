@@ -211,6 +211,7 @@ def _make_grid_actor(size=100.0, spacing=1.0):
     half = n * spacing / 2.0
     idx = 0
     base_r, base_g, base_b = 46, 48, 54  # grid line colour
+    fade_radius = half * 0.85  # fade starts at 85% of half-extent
     for i in range(n + 1):
         x = -half + i * spacing
         # Horizontal line: (x, -half) to (x, half)
@@ -222,8 +223,9 @@ def _make_grid_actor(size=100.0, spacing=1.0):
         # Fade: alpha based on distance of each endpoint from origin
         for py in (-half, half):
             dist = math.sqrt(x * x + py * py)
-            alpha = max(0, int(255 * max(0.0, 1.0 - dist / half)))
-            colours.InsertNextTuple4(base_r, base_g, base_b, alpha)
+            t = max(0.0, min(1.0, (dist - fade_radius) / (half - fade_radius)))
+            alpha = int(255 * (1.0 - t * t))  # quadratic falloff, starts late
+            colours.InsertNextTuple4(base_r, base_g, base_b, max(0, alpha))
         idx += 2
         # Vertical line: (-half, x) to (half, x)
         points.InsertNextPoint(-half, x, 0)
@@ -233,8 +235,9 @@ def _make_grid_actor(size=100.0, spacing=1.0):
         lines.InsertCellPoint(idx + 1)
         for px in (-half, half):
             dist = math.sqrt(px * px + x * x)
-            alpha = max(0, int(255 * max(0.0, 1.0 - dist / half)))
-            colours.InsertNextTuple4(base_r, base_g, base_b, alpha)
+            t = max(0.0, min(1.0, (dist - fade_radius) / (half - fade_radius)))
+            alpha = int(255 * (1.0 - t * t))
+            colours.InsertNextTuple4(base_r, base_g, base_b, max(0, alpha))
         idx += 2
     grid = vtkPolyData()
     grid.SetPoints(points)
@@ -523,11 +526,14 @@ class FreeIFCWindow(QMainWindow):
         renwin.SetNumberOfLayers(2)
         renwin.AddRenderer(self.renderer)
 
-        # Layer 1 — outline overlay
+        # Layer 1 — outline overlay (renders on top of all scene geometry)
         self.overlay = vtkRenderer()
         self.overlay.SetLayer(1)
-        self.overlay.SetErase(False)
         self.overlay.InteractiveOff()
+        self.overlay.SetUseFXAA(True)
+        # Preserve colour from layer 0 but clear depth so outlines always on top
+        self.overlay.SetPreserveColorBuffer(True)
+        self.overlay.SetPreserveDepthBuffer(False)
         renwin.AddRenderer(self.overlay)
         self.overlay.SetActiveCamera(self.renderer.GetActiveCamera())
 
