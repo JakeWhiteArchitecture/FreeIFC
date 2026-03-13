@@ -405,7 +405,23 @@ class FreeIFCWindow(QMainWindow):
         self.renderer.SetPass(ssao)
 
         # Interaction style — terrain locks up-vector to prevent flipping
+        # Subclass adds scroll-wheel zoom which vtkInteractorStyleTerrain lacks
         style = vtkInteractorStyleTerrain()
+
+        def _wheel_forward(obj, event):
+            cam = self.renderer.GetActiveCamera()
+            cam.Dolly(1.1)
+            self.renderer.ResetCameraClippingRange()
+            self._vtk_widget.GetRenderWindow().Render()
+
+        def _wheel_backward(obj, event):
+            cam = self.renderer.GetActiveCamera()
+            cam.Dolly(0.9)
+            self.renderer.ResetCameraClippingRange()
+            self._vtk_widget.GetRenderWindow().Render()
+
+        style.AddObserver("MouseWheelForwardEvent", _wheel_forward)
+        style.AddObserver("MouseWheelBackwardEvent", _wheel_backward)
         self._vtk_widget.GetRenderWindow().GetInteractor().SetInteractorStyle(style)
 
         # Picker
