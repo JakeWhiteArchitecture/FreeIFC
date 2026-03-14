@@ -1,2 +1,8 @@
 __pycache__/
 *.pyc
+web-ifc-src/
+build/
+*.so
+*.glb
+*.freeifc.npz
+*.skiplist
