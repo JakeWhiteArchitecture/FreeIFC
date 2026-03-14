@@ -425,6 +425,200 @@ class LoaderThread(QThread):
         return root
 
 
+# ── Chunked IFC → GLB converter thread ──────────────────────────────────────
+
+CHUNK_SIZE = 500  # target elements per IfcConvert chunk
+
+
+class GlbConverterThread(QThread):
+    """Background thread: chunked IFC → GLB conversion using IfcConvert."""
+
+    status_update = pyqtSignal(str)
+    conversion_complete = pyqtSignal(str)  # output GLB path
+    conversion_error = pyqtSignal(str)
+
+    def __init__(self, path: str):
+        super().__init__()
+        self.path = path
+
+    def _log(self, msg: str):
+        print(f"[FreeIFC/GLB] {msg}", file=sys.stderr, flush=True)
+        self.status_update.emit(msg)
+
+    def run(self):
+        glb_path = os.path.splitext(self.path)[0] + ".glb"
+
+        # ── Skip if GLB is already up to date ──────────────────────────
+        if os.path.isfile(glb_path):
+            ifc_mtime = os.path.getmtime(self.path)
+            glb_mtime = os.path.getmtime(glb_path)
+            if glb_mtime >= ifc_mtime:
+                self._log("GLB is up to date, skipping conversion.")
+                self.conversion_complete.emit(glb_path)
+                return
+
+        # ── Check prerequisites ────────────────────────────────────────
+        ifcconvert = shutil.which("IfcConvert") or shutil.which("ifcconvert")
+        if not ifcconvert:
+            self.conversion_error.emit("IfcConvert not found on PATH.")
+            return
+
+        try:
+            import trimesh  # noqa: F811
+        except ImportError:
+            self.conversion_error.emit("trimesh not installed.")
+            return
+
+        # ── Open IFC and group elements by type ────────────────────────
+        self._log("Analysing IFC for chunked GLB conversion…")
+        try:
+            model = ifcopenshell.open(self.path)
+        except Exception as exc:
+            self.conversion_error.emit(f"Failed to open IFC: {exc}")
+            return
+
+        type_counts: dict[str, int] = {}
+        for product in model.by_type("IfcProduct"):
+            t = product.is_a()
+            type_counts[t] = type_counts.get(t, 0) + 1
+        del model  # free memory
+
+        if not type_counts:
+            self.conversion_error.emit("No IfcProduct elements found.")
+            return
+
+        # ── Bundle types into chunks of ~CHUNK_SIZE elements ───────────
+        chunks: list[list[str]] = []
+        current_chunk: list[str] = []
+        current_count = 0
+        for ifc_type, count in type_counts.items():
+            if current_count > 0 and current_count + count > CHUNK_SIZE:
+                chunks.append(current_chunk)
+                current_chunk = []
+                current_count = 0
+            current_chunk.append(ifc_type)
+            current_count += count
+        if current_chunk:
+            chunks.append(current_chunk)
+
+        total_elements = sum(type_counts.values())
+        self._log(
+            f"Converting {total_elements} elements in {len(chunks)} chunk(s)…"
+        )
+
+        # ── Convert each chunk ─────────────────────────────────────────
+        tmp_dir = tempfile.mkdtemp(prefix="freeifc_glb_")
+        chunk_glbs: list[str] = []
+        try:
+            for i, chunk_types in enumerate(chunks):
+                chunk_elems = sum(type_counts[t] for t in chunk_types)
+                self._log(
+                    f"Chunk {i + 1}/{len(chunks)}: "
+                    f"{', '.join(chunk_types)} ({chunk_elems} elements)"
+                )
+                result = self._convert_chunk(
+                    ifcconvert, tmp_dir, i, chunk_types
+                )
+                if result:
+                    chunk_glbs.append(result)
+
+            if not chunk_glbs:
+                self.conversion_error.emit(
+                    "All chunks failed — no GLB produced."
+                )
+                return
+
+            # ── Merge chunk GLBs ───────────────────────────────────────
+            self._log(f"Merging {len(chunk_glbs)} GLB fragment(s)…")
+            self._merge_glbs(chunk_glbs, glb_path)
+
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+        if os.path.isfile(glb_path):
+            size_mb = os.path.getsize(glb_path) / 1048576
+            self._log(f"GLB ready: {glb_path} ({size_mb:.1f} MB)")
+            self.conversion_complete.emit(glb_path)
+        else:
+            self.conversion_error.emit("GLB merge produced no output.")
+
+    def _convert_chunk(
+        self, ifcconvert: str, tmp_dir: str, idx: int, types: list[str]
+    ) -> str | None:
+        """Extract subset IFC, run IfcConvert, return GLB path or None."""
+        try:
+            import ifcpatch
+
+            model = ifcopenshell.open(self.path)
+            query = ", ".join(types)
+            subset = ifcpatch.execute({
+                "input": self.path,
+                "file": model,
+                "recipe": "ExtractElements",
+                "arguments": [query],
+            })
+            del model
+
+            subset_ifc = os.path.join(tmp_dir, f"chunk_{idx}.ifc")
+            subset.write(subset_ifc)
+            del subset
+        except Exception as exc:
+            self._log(f"  Chunk {idx + 1} extract failed: {exc}")
+            return None
+
+        chunk_glb = os.path.join(tmp_dir, f"chunk_{idx}.glb")
+        try:
+            ncpu = os.cpu_count() or 4
+            result = subprocess.run(
+                [ifcconvert, "--use-element-guids", "-j", str(ncpu),
+                 subset_ifc, chunk_glb],
+                capture_output=True, text=True, timeout=120,
+            )
+            if result.returncode != 0:
+                stderr = (result.stderr or "").strip()[:200]
+                self._log(f"  Chunk {idx + 1} IfcConvert failed: {stderr}")
+                return None
+        except subprocess.TimeoutExpired:
+            self._log(f"  Chunk {idx + 1} timed out (120s)")
+            return None
+        except Exception as exc:
+            self._log(f"  Chunk {idx + 1} error: {exc}")
+            return None
+        finally:
+            try:
+                os.remove(subset_ifc)
+            except Exception:
+                pass
+
+        if os.path.isfile(chunk_glb):
+            return chunk_glb
+        return None
+
+    def _merge_glbs(self, chunk_glbs: list[str], output_path: str):
+        """Merge multiple GLB files into one. Fallback: keep largest."""
+        import trimesh
+
+        if len(chunk_glbs) == 1:
+            shutil.copy2(chunk_glbs[0], output_path)
+            return
+
+        try:
+            combined = trimesh.Scene()
+            for glb_path in chunk_glbs:
+                scene = trimesh.load(glb_path, process=False)
+                if isinstance(scene, trimesh.Scene):
+                    for name, geom in scene.geometry.items():
+                        T, _ = scene.graph[name] if name in scene.graph.nodes_geometry else (np.eye(4), name)
+                        combined.add_geometry(geom, node_name=name, transform=T)
+                elif hasattr(scene, "vertices"):
+                    combined.add_geometry(scene)
+            combined.export(output_path, file_type="glb")
+        except Exception as exc:
+            self._log(f"Merge failed ({exc}), using largest chunk as fallback")
+            largest = max(chunk_glbs, key=os.path.getsize)
+            shutil.copy2(largest, output_path)
+
+
 # ── Ground plane grid ────────────────────────────────────────────────────────
 
 def _make_grid_actor(size=100.0, spacing=1.0):
@@ -557,6 +751,7 @@ class FreeIFCWindow(QMainWindow):
         self._selected_guid: str | None = None
         self._selection_outline: vtkActor | None = None
         self._loader: LoaderThread | None = None
+        self._glb_converter: GlbConverterThread | None = None
         self._loading = False
         self._edges_visible = True
         self._lod_enabled = False
@@ -1154,8 +1349,18 @@ class FreeIFCWindow(QMainWindow):
         self._loader.load_error.connect(self._on_load_error)
         self._loader.start()
 
+        # Start GLB conversion in parallel (does not block viewer)
+        self._glb_converter = GlbConverterThread(path)
+        self._glb_converter.conversion_complete.connect(self._on_glb_complete)
+        self._glb_converter.conversion_error.connect(self._on_glb_error)
+        self._glb_converter.start()
+
     def _clear_scene(self):
         self._deselect()
+        if self._glb_converter is not None:
+            self._glb_converter.quit()
+            self._glb_converter.wait(2000)
+            self._glb_converter = None
         if self._edge_build_timer is not None:
             self._edge_build_timer.stop()
             self._edge_build_timer = None
@@ -1244,6 +1449,15 @@ class FreeIFCWindow(QMainWindow):
         self._progress.hide()
         self._progress_label.setText(msg)
         self._progress_label.show()
+
+    # ── GLB converter signals ────────────────────────────────────────────
+
+    def _on_glb_complete(self, glb_path: str):
+        title = self.windowTitle().replace(" [GLB ready]", "")
+        self.setWindowTitle(f"{title} [GLB ready]")
+
+    def _on_glb_error(self, msg: str):
+        print(f"[FreeIFC/GLB] Error: {msg}", file=sys.stderr, flush=True)
 
     # ── On-demand geometry loading ───────────────────────────────────────
 
