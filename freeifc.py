@@ -11,9 +11,12 @@ Dependencies:
 
 import sys
 import os
+import io
 import math
 import shutil
 import subprocess
+import tempfile
+import zipfile as zf
 import numpy as np
 
 import ifcopenshell
@@ -116,14 +119,14 @@ class LoaderThread(QThread):
                     self._log("Loading cached geometry…")
                     guids = list(cache["_guids"])
                     types = list(cache["_types"])
+                    cache.close()
+                    # Metadata-only elements dict — geometry loaded on demand
                     elements = {}
                     for i, guid in enumerate(guids):
                         elements[guid] = {
-                            "verts": cache[f"v_{i}"],
-                            "faces": cache[f"f_{i}"],
                             "type": str(types[i]),
+                            "cache_idx": i,
                         }
-                    cache.close()
                     model = ifcopenshell.open(self.path)
                     for guid in elements:
                         try:
@@ -135,16 +138,29 @@ class LoaderThread(QThread):
                                 "GlobalId": guid,
                             }
                     hierarchy = self._build_hierarchy(model)
-                    self.load_complete.emit({"elements": elements, "hierarchy": hierarchy})
+                    self.load_complete.emit({
+                        "elements": elements,
+                        "cache_path": cache_path,
+                        "hierarchy": hierarchy,
+                    })
                     return
             except Exception:
                 pass
 
+        # ── Stream geometry to temp files ────────────────────────────
+        tmp_dir = tempfile.mkdtemp(prefix="freeifc_")
+        try:
+            self._run_with_tmp(cache_path, ifc_mtime, tmp_dir)
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def _run_with_tmp(self, cache_path, ifc_mtime, tmp_dir):
+        """Fresh load: stream geometry to temp files, build cache, emit."""
         # ── Try IfcConvert (fast C++ path) ───────────────────────────
         ifcconvert = shutil.which("IfcConvert") or shutil.which("ifcconvert")
         if ifcconvert:
             self._log(f"Found IfcConvert: {ifcconvert}")
-            elements = self._load_via_ifcconvert(ifcconvert)
+            elements = self._load_via_ifcconvert(ifcconvert, tmp_dir)
             if elements:
                 self._log(f"IfcConvert: {len(elements)} elements loaded")
         else:
@@ -154,7 +170,7 @@ class LoaderThread(QThread):
         # ── Fallback: ifcopenshell.geom.iterator ─────────────────────
         if elements is None:
             self._log("Falling back to ifcopenshell tessellation…")
-            elements = self._load_via_iterator()
+            elements = self._load_via_iterator(tmp_dir)
 
         if elements is None:
             return  # error already emitted
@@ -177,27 +193,53 @@ class LoaderThread(QThread):
                 elements[guid]["type"] = el.is_a()
                 elements[guid]["props"] = self._build_props(el)
             except Exception:
-                elements[guid].setdefault("props", {"Type": elements[guid].get("type", ""), "GlobalId": guid})
+                elements[guid].setdefault("props", {
+                    "Type": elements[guid].get("type", ""),
+                    "GlobalId": guid,
+                })
 
         hierarchy = self._build_hierarchy(model)
 
-        # ── Save cache (npz — memory-efficient) ──────────────────────
+        # ── Build cache incrementally from temp files ────────────────
         self._log("Saving cache…")
         try:
             guids = list(elements.keys())
             types = [elements[g].get("type", "") for g in guids]
-            arrays = {"_mtime": np.array(ifc_mtime), "_guids": np.array(guids), "_types": np.array(types)}
-            for i, guid in enumerate(guids):
-                arrays[f"v_{i}"] = elements[guid]["verts"]
-                arrays[f"f_{i}"] = elements[guid]["faces"]
-            np.savez(cache_path, **arrays)
+            self._build_cache(cache_path, ifc_mtime, guids, types, tmp_dir)
         except Exception:
             pass
 
-        self.load_complete.emit({"elements": elements, "hierarchy": hierarchy})
+        self.load_complete.emit({
+            "elements": elements,
+            "cache_path": cache_path,
+            "hierarchy": hierarchy,
+        })
 
-    def _load_via_ifcconvert(self, ifcconvert: str) -> dict | None:
-        """Fast path: IfcConvert → GLB → trimesh."""
+    def _build_cache(self, cache_path, ifc_mtime, guids, types, tmp_dir):
+        """Build .npz cache incrementally from temp files, one element at a time."""
+        with zf.ZipFile(cache_path, 'w', zf.ZIP_STORED) as z:
+            for name, arr in [("_mtime", np.array(ifc_mtime)),
+                              ("_guids", np.array(guids)),
+                              ("_types", np.array(types))]:
+                buf = io.BytesIO()
+                np.save(buf, arr)
+                z.writestr(f"{name}.npy", buf.getvalue())
+
+            for i in range(len(guids)):
+                v = np.load(os.path.join(tmp_dir, f"{i}_v.npy"))
+                buf = io.BytesIO()
+                np.save(buf, v)
+                z.writestr(f"v_{i}.npy", buf.getvalue())
+                del v, buf
+
+                f = np.load(os.path.join(tmp_dir, f"{i}_f.npy"))
+                buf = io.BytesIO()
+                np.save(buf, f)
+                z.writestr(f"f_{i}.npy", buf.getvalue())
+                del f, buf
+
+    def _load_via_ifcconvert(self, ifcconvert: str, tmp_dir: str) -> dict | None:
+        """Fast path: IfcConvert → GLB → trimesh. Streams geometry to temp files."""
         try:
             import trimesh
         except ImportError:
@@ -243,6 +285,7 @@ class LoaderThread(QThread):
 
         self._log("Processing geometry…")
         elements = {}
+        idx = 0
 
         if isinstance(scene, trimesh.Scene):
             for node_name in scene.graph.nodes_geometry:
@@ -254,20 +297,24 @@ class LoaderThread(QThread):
                         verts = (T[:3, :3] @ verts.T).T + T[:3, 3]
                     faces = np.array(mesh.faces, dtype=np.int64)
                     if len(verts) > 0 and len(faces) > 0:
-                        elements[node_name] = {"verts": verts, "faces": faces, "type": ""}
+                        np.save(os.path.join(tmp_dir, f"{idx}_v.npy"), verts)
+                        np.save(os.path.join(tmp_dir, f"{idx}_f.npy"), faces)
+                        elements[node_name] = {"type": "", "cache_idx": idx}
+                        idx += 1
                 except Exception:
                     continue
         elif hasattr(scene, "vertices"):
-            elements["unknown"] = {
-                "verts": np.array(scene.vertices, dtype=np.float64),
-                "faces": np.array(scene.faces, dtype=np.int64),
-                "type": "",
-            }
+            verts = np.array(scene.vertices, dtype=np.float64)
+            faces = np.array(scene.faces, dtype=np.int64)
+            np.save(os.path.join(tmp_dir, f"{idx}_v.npy"), verts)
+            np.save(os.path.join(tmp_dir, f"{idx}_f.npy"), faces)
+            elements["unknown"] = {"type": "", "cache_idx": idx}
 
+        del scene  # free trimesh scene memory
         return elements if elements else None
 
-    def _load_via_iterator(self) -> dict | None:
-        """Fallback: ifcopenshell.geom.iterator (slower but always works)."""
+    def _load_via_iterator(self, tmp_dir: str) -> dict | None:
+        """Fallback: ifcopenshell.geom.iterator. Streams geometry to temp files."""
         import ifcopenshell.geom
 
         try:
@@ -302,6 +349,7 @@ class LoaderThread(QThread):
 
         elements = {}
         n_done = 0
+        idx = 0
         n_total = len(model.by_type("IfcProduct"))
 
         while True:
@@ -310,7 +358,10 @@ class LoaderThread(QThread):
                 verts = np.array(shape.geometry.verts, dtype=np.float64).reshape(-1, 3)
                 faces = np.array(shape.geometry.faces, dtype=np.int64).reshape(-1, 3)
                 if len(verts) > 0 and len(faces) > 0:
-                    elements[shape.guid] = {"verts": verts, "faces": faces, "type": ""}
+                    np.save(os.path.join(tmp_dir, f"{idx}_v.npy"), verts)
+                    np.save(os.path.join(tmp_dir, f"{idx}_f.npy"), faces)
+                    elements[shape.guid] = {"type": "", "cache_idx": idx}
+                    idx += 1
             except Exception:
                 pass
 
@@ -499,7 +550,8 @@ class FreeIFCWindow(QMainWindow):
         reset_action.triggered.connect(self._on_reset_visibility)
 
         # State — merged architecture
-        self._elements: dict[str, dict] = {}       # guid → {verts, faces, type, props}
+        self._elements: dict[str, dict] = {}       # guid → {type, props, cache_idx}
+        self._cache = None                          # lazy NpzFile for on-demand geometry
         self._type_groups: dict[str, dict] = {}     # ifc_type → {guids, actor, edge_actor, cell_guids}
         self._hidden_guids: set[str] = set()
         self._selected_guid: str | None = None
@@ -1115,6 +1167,9 @@ class FreeIFCWindow(QMainWindow):
                 self.renderer.RemoveActor(group["edge_actor"])
         self._type_groups.clear()
         self._elements.clear()
+        if self._cache is not None:
+            self._cache.close()
+            self._cache = None
         self._hidden_guids.clear()
         self._tree.clear()
         self._vtk_widget.GetRenderWindow().Render()
@@ -1131,6 +1186,13 @@ class FreeIFCWindow(QMainWindow):
 
         self._elements = data["elements"]
         hierarchy = data["hierarchy"]
+
+        # Open cache for on-demand geometry loading
+        cache_path = data.get("cache_path")
+        if cache_path and os.path.isfile(cache_path):
+            self._cache = np.load(cache_path, allow_pickle=True)
+        else:
+            self._cache = None
 
         # Group elements by IFC type
         type_map: dict[str, list[str]] = {}
@@ -1183,6 +1245,16 @@ class FreeIFCWindow(QMainWindow):
         self._progress_label.setText(msg)
         self._progress_label.show()
 
+    # ── On-demand geometry loading ───────────────────────────────────────
+
+    def _load_geom(self, guid):
+        """Load geometry for a single element from cache on demand."""
+        elem = self._elements.get(guid)
+        if elem is None or self._cache is None:
+            return None, None
+        i = elem["cache_idx"]
+        return self._cache[f"v_{i}"], self._cache[f"f_{i}"]
+
     # ── Merged actor building ────────────────────────────────────────────
 
     def _rebuild_type_actor(self, ifc_type: str):
@@ -1196,7 +1268,7 @@ class FreeIFCWindow(QMainWindow):
             self.renderer.RemoveActor(group["actor"])
             group["actor"] = None
 
-        # Concatenate visible elements
+        # Concatenate visible elements — geometry loaded on demand from cache
         all_verts = []
         all_faces = []
         cell_guids = []
@@ -1205,11 +1277,9 @@ class FreeIFCWindow(QMainWindow):
         for guid in group["guids"]:
             if guid in self._hidden_guids:
                 continue
-            elem = self._elements.get(guid)
-            if elem is None:
+            v, f = self._load_geom(guid)
+            if v is None:
                 continue
-            v = elem["verts"]
-            f = elem["faces"]
             all_verts.append(v)
             all_faces.append(f + vert_offset)
             cell_guids.extend([guid] * len(f))
@@ -1261,7 +1331,7 @@ class FreeIFCWindow(QMainWindow):
         if not self._edges_visible:
             return
 
-        # Concatenate visible elements
+        # Concatenate visible elements — geometry loaded on demand from cache
         all_verts = []
         all_faces = []
         vert_offset = 0
@@ -1269,11 +1339,9 @@ class FreeIFCWindow(QMainWindow):
         for guid in group["guids"]:
             if guid in self._hidden_guids:
                 continue
-            elem = self._elements.get(guid)
-            if elem is None:
+            v, f = self._load_geom(guid)
+            if v is None:
                 continue
-            v = elem["verts"]
-            f = elem["faces"]
             all_verts.append(v)
             all_faces.append(f + vert_offset)
             vert_offset += len(v)
@@ -1390,7 +1458,10 @@ class FreeIFCWindow(QMainWindow):
             return
 
         # Create outline actor from element's individual geometry
-        polydata = _make_polydata(elem["verts"], elem["faces"])
+        v, f = self._load_geom(guid)
+        if v is None:
+            return
+        polydata = _make_polydata(v, f)
         normals = vtkPolyDataNormals()
         normals.SetInputData(polydata)
         normals.ComputePointNormalsOn()
