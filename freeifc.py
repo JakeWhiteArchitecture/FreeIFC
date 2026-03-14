@@ -12,10 +12,12 @@ Dependencies:
 import sys
 import os
 import io
+import json
 import math
 import shutil
 import subprocess
 import tempfile
+import time
 import zipfile as zf
 import numpy as np
 
@@ -90,192 +92,400 @@ def _opacity_for(ifc_type: str):
     return TYPE_OPACITIES.get(ifc_type, DEFAULT_OPACITY)
 
 
-# ── Loader thread — IfcConvert (fast) or ifcopenshell fallback + cache ───────
+# ── Loader thread — self-healing dual-path with skiplist ─────────────────────
 
 class LoaderThread(QThread):
-    status_update = pyqtSignal(str)
-    load_complete = pyqtSignal(dict)
-    load_error    = pyqtSignal(str)
+    load_progress = pyqtSignal(int, str)   # percent 0–100, detail label
+    load_complete = pyqtSignal(dict)       # full result dict
+    load_error    = pyqtSignal(str)        # fatal only — nothing loaded
 
     def __init__(self, path: str):
         super().__init__()
         self.path = path
 
-    def _log(self, msg: str):
-        """Emit status update AND print to console for debugging."""
-        print(f"[FreeIFC] {msg}", file=sys.stderr, flush=True)
-        self.status_update.emit(msg)
+    def _emit(self, pct: int, label: str):
+        print(f"[FreeIFC] [{pct:3d}%] {label}", file=sys.stderr, flush=True)
+        self.load_progress.emit(pct, label)
+
+    # ── Entry point ─────────────────────────────────────────────────
 
     def run(self):
+        try:
+            self._run_impl()
+        except Exception as exc:
+            self.load_error.emit(f"Unexpected loader error: {exc}")
+
+    def _run_impl(self):
         cache_path = self.path + ".freeifc.npz"
+        skiplist_path = self.path + ".skiplist"
         ifc_mtime = os.path.getmtime(self.path)
 
-        # ── Try cache ────────────────────────────────────────────────
+        # ── Phase 1: Scan (0–5%) ───────────────────────────────────
+        self._emit(0, "Scanning IFC metadata…")
+
+        # Try cache first
         if os.path.isfile(cache_path):
             try:
                 cache = np.load(cache_path, allow_pickle=True)
                 stored_mtime = float(cache["_mtime"])
                 if stored_mtime >= ifc_mtime:
-                    self._log("Loading cached geometry…")
-                    guids = list(cache["_guids"])
-                    types = list(cache["_types"])
-                    cache.close()
-                    # Metadata-only elements dict — geometry loaded on demand
-                    elements = {}
-                    for i, guid in enumerate(guids):
-                        elements[guid] = {
-                            "type": str(types[i]),
-                            "cache_idx": i,
-                        }
-                    model = ifcopenshell.open(self.path)
-                    for guid in elements:
-                        try:
-                            el = model.by_guid(guid)
-                            elements[guid]["props"] = self._build_props(el)
-                        except Exception:
-                            elements[guid]["props"] = {
-                                "Type": elements[guid].get("type", ""),
-                                "GlobalId": guid,
-                            }
-                    hierarchy = self._build_hierarchy(model)
-                    self.load_complete.emit({
-                        "elements": elements,
-                        "cache_path": cache_path,
-                        "hierarchy": hierarchy,
-                    })
+                    self._emit(2, "Loading cached geometry…")
+                    self._load_from_cache(
+                        cache, cache_path, skiplist_path, ifc_mtime
+                    )
                     return
+                cache.close()
             except Exception:
                 pass
 
-        # ── Stream geometry to temp files ────────────────────────────
+        # Open model for fresh load
+        try:
+            model = ifcopenshell.open(self.path)
+        except Exception as exc:
+            self.load_error.emit(f"Failed to open IFC file:\n{exc}")
+            return
+
+        products = model.by_type("IfcProduct")
+        n_total = len(products)
+        self._emit(3, f"Scanning IFC — {n_total:,} elements found")
+
+        # Build product info lookup
+        product_info = {}
+        for p in products:
+            product_info[p.GlobalId] = {
+                "type": p.is_a(),
+                "name": getattr(p, "Name", None) or "",
+                "step_id": p.id(),
+            }
+
+        # Load skiplist
+        skiplist = self._read_skiplist(skiplist_path, ifc_mtime)
+        corrupt_guids = set()
+        if skiplist:
+            corrupt_guids = {e["guid"] for e in skiplist.get("corrupt", [])}
+
+        self._emit(5, f"Scanning IFC — {n_total:,} elements found")
+
+        # Fresh load to temp dir
         tmp_dir = tempfile.mkdtemp(prefix="freeifc_")
         try:
-            self._run_with_tmp(cache_path, ifc_mtime, tmp_dir)
+            self._fresh_load(
+                model, product_info, n_total,
+                cache_path, skiplist_path, ifc_mtime,
+                corrupt_guids, tmp_dir,
+            )
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
-    def _run_with_tmp(self, cache_path, ifc_mtime, tmp_dir):
-        """Fresh load: stream geometry to temp files, build cache, emit."""
-        # ── Try IfcConvert (fast C++ path) ───────────────────────────
+    # ── Cache hit path ─────────────────────────────────────────────
+
+    def _load_from_cache(self, cache, cache_path, skiplist_path, ifc_mtime):
+        guids = list(cache["_guids"])
+        types = list(cache["_types"])
+        cache.close()
+
+        elements = {}
+        for i, guid in enumerate(guids):
+            elements[guid] = {
+                "type": str(types[i]),
+                "cache_idx": i,
+            }
+
+        self._emit(40, f"Loading cached geometry — {len(elements):,} elements")
+        model = ifcopenshell.open(self.path)
+        for guid in elements:
+            if self.isInterruptionRequested():
+                return
+            try:
+                el = model.by_guid(guid)
+                elements[guid]["props"] = self._build_props(el)
+            except Exception:
+                elements[guid]["props"] = {
+                    "Type": elements[guid].get("type", ""),
+                    "GlobalId": guid,
+                }
+
+        hierarchy = self._build_hierarchy(model)
+
+        # Attach skiplist info for UI
+        skiplist = self._read_skiplist(skiplist_path, ifc_mtime)
+        failed_elements = []
+        if skiplist:
+            for entry in skiplist.get("corrupt", []):
+                guid = entry["guid"]
+                failed_elements.append({
+                    "guid": guid,
+                    "type": entry.get("type", ""),
+                    "name": entry.get("name", ""),
+                    "error": entry.get("error", ""),
+                })
+                if guid not in elements:
+                    elements[guid] = {
+                        "type": entry.get("type", ""),
+                        "failed": True,
+                        "props": {
+                            "Type": entry.get("type", ""),
+                            "Name": entry.get("name", ""),
+                            "GlobalId": guid,
+                        },
+                    }
+
+        self._emit(85, "Cache loaded — building scene…")
+        self.load_complete.emit({
+            "elements": elements,
+            "cache_path": cache_path,
+            "hierarchy": hierarchy,
+            "fallback_elements": [],
+            "failed_elements": failed_elements,
+        })
+
+    # ── Fresh load ─────────────────────────────────────────────────
+
+    def _fresh_load(self, model, product_info, n_total,
+                    cache_path, skiplist_path, ifc_mtime,
+                    corrupt_guids, tmp_dir):
+        elements = {}
+        idx = 0
+        fallback_guids = set()
+        failed_list = []
+        used_fallback = False
+        ifcconvert_ok = False
+        n_clean = n_total - len(corrupt_guids)
+
+        # ── Phase 2: IfcConvert (5–60%) ────────────────────────────
         ifcconvert = shutil.which("IfcConvert") or shutil.which("ifcconvert")
+
         if ifcconvert:
-            self._log(f"Found IfcConvert: {ifcconvert}")
-            elements = self._load_via_ifcconvert(ifcconvert, tmp_dir)
-            if elements:
-                self._log(f"IfcConvert: {len(elements)} elements loaded")
+            if corrupt_guids:
+                self._emit(
+                    6,
+                    f"IfcConvert — extracting {n_clean:,} clean elements…",
+                )
+                subset_path = self._extract_clean_subset(
+                    model, corrupt_guids, tmp_dir
+                )
+                target_path = subset_path if subset_path else self.path
+                label_n = n_clean if subset_path else n_total
+            else:
+                target_path = self.path
+                label_n = n_total
+                subset_path = None
+
+            self._emit(
+                8, f"IfcConvert — converting {label_n:,} elements…"
+            )
+            t0 = time.monotonic()
+            ic_elements = self._run_ifcconvert(
+                ifcconvert, target_path, tmp_dir, idx
+            )
+            elapsed = time.monotonic() - t0
+
+            if subset_path:
+                try:
+                    os.remove(subset_path)
+                except Exception:
+                    pass
+
+            if ic_elements is not None:
+                ifcconvert_ok = True
+                elements.update(ic_elements)
+                idx += len(ic_elements)
+                self._emit(
+                    60,
+                    f"IfcConvert — complete ({elapsed:.1f}s, "
+                    f"{len(ic_elements):,} elements)",
+                )
+            else:
+                self._emit(
+                    60,
+                    "IfcConvert failed — starting fallback tessellation…",
+                )
         else:
-            self._log("IfcConvert not on PATH, using Python fallback…")
-            elements = None
+            self._emit(
+                8,
+                "IfcConvert not on PATH — using ifcopenshell tessellation…",
+            )
 
-        # ── Fallback: ifcopenshell.geom.iterator ─────────────────────
-        if elements is None:
-            self._log("Falling back to ifcopenshell tessellation…")
-            elements = self._load_via_iterator(tmp_dir)
+        # ── Phase 3: Fallback tessellation (60–85%) ────────────────
+        if not ifcconvert_ok:
+            # Full fallback — iterate all elements
+            used_fallback = True
+            fb_elements, fb_failed = self._iterate_all(
+                model, product_info, tmp_dir, idx, n_total, 60, 85,
+            )
+            elements.update(fb_elements)
+            idx += len(fb_elements)
+            for guid in fb_elements:
+                fallback_guids.add(guid)
+            failed_list.extend(fb_failed)
+        elif corrupt_guids:
+            # Skiplist-only fallback (60–70%)
+            used_fallback = True
+            fb_elements, fb_failed = self._iterate_guids(
+                model, list(corrupt_guids), product_info,
+                tmp_dir, idx, 60, 70,
+            )
+            elements.update(fb_elements)
+            idx += len(fb_elements)
+            for guid in fb_elements:
+                fallback_guids.add(guid)
+            failed_list.extend(fb_failed)
 
-        if elements is None:
-            return  # error already emitted
+        if self.isInterruptionRequested():
+            return
 
         if not elements:
             self.load_error.emit("No geometry found in IFC file.")
             return
 
-        # ── Load IFC metadata ────────────────────────────────────────
-        self._log("Reading IFC metadata…")
-        try:
-            model = ifcopenshell.open(self.path)
-        except Exception as exc:
-            self.load_error.emit(f"Failed to read IFC metadata:\n{exc}")
-            return
-
+        # ── Load metadata ──────────────────────────────────────────
+        self._emit(78, "Reading IFC metadata…")
         for guid in list(elements.keys()):
+            if self.isInterruptionRequested():
+                return
+            info = product_info.get(guid, {})
+            elements[guid]["type"] = info.get("type", "")
             try:
                 el = model.by_guid(guid)
-                elements[guid]["type"] = el.is_a()
                 elements[guid]["props"] = self._build_props(el)
             except Exception:
-                elements[guid].setdefault("props", {
-                    "Type": elements[guid].get("type", ""),
+                elements[guid]["props"] = {
+                    "Type": info.get("type", ""),
                     "GlobalId": guid,
-                })
+                }
+            if guid in fallback_guids:
+                elements[guid]["fallback"] = True
+
+        # Add failed elements to dict for property display
+        for entry in failed_list:
+            guid = entry["guid"]
+            if guid not in elements:
+                elements[guid] = {
+                    "type": entry.get("type", ""),
+                    "failed": True,
+                    "props": {
+                        "Type": entry.get("type", ""),
+                        "Name": entry.get("name", ""),
+                        "GlobalId": guid,
+                    },
+                }
 
         hierarchy = self._build_hierarchy(model)
 
-        # ── Build cache incrementally from temp files ────────────────
-        self._log("Saving cache…")
+        # ── Write skiplist ─────────────────────────────────────────
+        if used_fallback or not ifcconvert_ok:
+            self._emit(80, "Writing skiplist…")
+            self._write_skiplist(skiplist_path, ifc_mtime, failed_list)
+
+        # ── Build cache ────────────────────────────────────────────
+        self._emit(82, "Saving geometry cache…")
         try:
-            guids = list(elements.keys())
-            types = [elements[g].get("type", "") for g in guids]
-            self._build_cache(cache_path, ifc_mtime, guids, types, tmp_dir)
+            cache_guids = [
+                g for g in elements if "cache_idx" in elements[g]
+            ]
+            cache_types = [
+                elements[g].get("type", "") for g in cache_guids
+            ]
+            self._build_cache(
+                cache_path, ifc_mtime, cache_guids, cache_types,
+                elements, tmp_dir,
+            )
         except Exception:
             pass
 
+        # Build result lists
+        fallback_elements = []
+        for guid in fallback_guids:
+            info = product_info.get(guid, {})
+            fallback_elements.append({
+                "guid": guid,
+                "type": info.get("type", ""),
+                "name": info.get("name", ""),
+            })
+
+        self._emit(85, "Loading complete — building scene…")
         self.load_complete.emit({
             "elements": elements,
             "cache_path": cache_path,
             "hierarchy": hierarchy,
+            "fallback_elements": fallback_elements,
+            "failed_elements": failed_list,
         })
 
-    def _build_cache(self, cache_path, ifc_mtime, guids, types, tmp_dir):
-        """Build .npz cache incrementally from temp files, one element at a time."""
-        with zf.ZipFile(cache_path, 'w', zf.ZIP_STORED) as z:
-            for name, arr in [("_mtime", np.array(ifc_mtime)),
-                              ("_guids", np.array(guids)),
-                              ("_types", np.array(types))]:
-                buf = io.BytesIO()
-                np.save(buf, arr)
-                z.writestr(f"{name}.npy", buf.getvalue())
+    # ── IfcConvert ─────────────────────────────────────────────────
 
-            for i in range(len(guids)):
-                v = np.load(os.path.join(tmp_dir, f"{i}_v.npy"))
-                buf = io.BytesIO()
-                np.save(buf, v)
-                z.writestr(f"v_{i}.npy", buf.getvalue())
-                del v, buf
+    def _extract_clean_subset(self, model, corrupt_guids, tmp_dir):
+        """Use ifcpatch to extract elements not in the skiplist."""
+        try:
+            import ifcpatch
+        except ImportError:
+            return None
+        try:
+            clean_elements = [
+                p for p in model.by_type("IfcProduct")
+                if p.GlobalId not in corrupt_guids
+            ]
+            if not clean_elements:
+                return None
+            query = "|".join(f"#{el.id()}" for el in clean_elements)
+            subset = ifcpatch.execute({
+                "input": self.path,
+                "file": model,
+                "recipe": "ExtractElements",
+                "arguments": [query],
+            })
+            subset_path = os.path.join(tmp_dir, "clean_subset.ifc")
+            subset.write(subset_path)
+            del subset
+            return subset_path
+        except Exception as exc:
+            print(
+                f"[FreeIFC] Subset extraction failed: {exc}",
+                file=sys.stderr, flush=True,
+            )
+            return None
 
-                f = np.load(os.path.join(tmp_dir, f"{i}_f.npy"))
-                buf = io.BytesIO()
-                np.save(buf, f)
-                z.writestr(f"f_{i}.npy", buf.getvalue())
-                del f, buf
-
-    def _load_via_ifcconvert(self, ifcconvert: str, tmp_dir: str) -> dict | None:
-        """Fast path: IfcConvert → GLB → trimesh. Streams geometry to temp files."""
+    def _run_ifcconvert(self, ifcconvert, ifc_path, tmp_dir, start_idx):
+        """Run IfcConvert → GLB → trimesh. Returns elements dict or None."""
         try:
             import trimesh
         except ImportError:
-            self._log("trimesh not installed, using fallback…")
             return None
 
-        glb_path = self.path + ".tmp.glb"
-        self._log("Converting IFC geometry (IfcConvert)…")
+        glb_path = os.path.join(tmp_dir, "ifcconvert_output.glb")
         try:
-            ncpu = os.cpu_count() or 4
             result = subprocess.run(
-                [ifcconvert, "--use-element-guids", "-j", str(ncpu),
-                 self.path, glb_path],
+                [ifcconvert, "--use-element-guids", "-j", "1",
+                 ifc_path, glb_path],
                 capture_output=True, text=True, timeout=600,
             )
             if result.returncode != 0:
-                stderr = result.stderr.strip()[:300] if result.stderr else "unknown error"
-                self._log(f"IfcConvert failed (code {result.returncode}): {stderr}")
+                stderr = (result.stderr or "").strip()[:300]
+                print(
+                    f"[FreeIFC] IfcConvert failed "
+                    f"(code {result.returncode}): {stderr}",
+                    file=sys.stderr, flush=True,
+                )
                 return None
         except subprocess.TimeoutExpired:
-            self._log("IfcConvert timed out (10 min), using fallback…")
+            print(
+                "[FreeIFC] IfcConvert timed out (10 min)",
+                file=sys.stderr, flush=True,
+            )
             return None
         except Exception as exc:
-            self._log(f"IfcConvert error: {exc}")
+            print(
+                f"[FreeIFC] IfcConvert error: {exc}",
+                file=sys.stderr, flush=True,
+            )
             return None
 
         if not os.path.isfile(glb_path):
-            self._log("IfcConvert produced no output file, using fallback…")
             return None
 
-        glb_size = os.path.getsize(glb_path)
-        self._log(f"Loading GLB geometry ({glb_size / 1048576:.1f} MB)…")
         try:
             scene = trimesh.load(glb_path, process=False)
-        except Exception as exc:
-            self._log(f"GLB load failed: {exc}")
+        except Exception:
             return None
         finally:
             try:
@@ -283,12 +493,13 @@ class LoaderThread(QThread):
             except Exception:
                 pass
 
-        self._log("Processing geometry…")
         elements = {}
-        idx = 0
+        idx = start_idx
 
         if isinstance(scene, trimesh.Scene):
             for node_name in scene.graph.nodes_geometry:
+                if self.isInterruptionRequested():
+                    break
                 try:
                     T, geom_name = scene.graph[node_name]
                     mesh = scene.geometry[geom_name]
@@ -297,9 +508,15 @@ class LoaderThread(QThread):
                         verts = (T[:3, :3] @ verts.T).T + T[:3, 3]
                     faces = np.array(mesh.faces, dtype=np.int64)
                     if len(verts) > 0 and len(faces) > 0:
-                        np.save(os.path.join(tmp_dir, f"{idx}_v.npy"), verts)
-                        np.save(os.path.join(tmp_dir, f"{idx}_f.npy"), faces)
-                        elements[node_name] = {"type": "", "cache_idx": idx}
+                        np.save(
+                            os.path.join(tmp_dir, f"{idx}_v.npy"), verts
+                        )
+                        np.save(
+                            os.path.join(tmp_dir, f"{idx}_f.npy"), faces
+                        )
+                        elements[node_name] = {
+                            "type": "", "cache_idx": idx,
+                        }
                         idx += 1
                 except Exception:
                     continue
@@ -310,19 +527,13 @@ class LoaderThread(QThread):
             np.save(os.path.join(tmp_dir, f"{idx}_f.npy"), faces)
             elements["unknown"] = {"type": "", "cache_idx": idx}
 
-        del scene  # free trimesh scene memory
+        del scene
         return elements if elements else None
 
-    def _load_via_iterator(self, tmp_dir: str) -> dict | None:
-        """Fallback: ifcopenshell.geom.iterator. Streams geometry to temp files."""
+    # ── Fallback tessellation ──────────────────────────────────────
+
+    def _geom_settings(self):
         import ifcopenshell.geom
-
-        try:
-            model = ifcopenshell.open(self.path)
-        except Exception as exc:
-            self.load_error.emit(f"Failed to open IFC file:\n{exc}")
-            return None
-
         settings = ifcopenshell.geom.settings()
         try:
             settings.set("use-world-coords", True)
@@ -333,41 +544,81 @@ class LoaderThread(QThread):
                 settings.set(settings.WELD_VERTICES, True)
             except Exception:
                 pass
+        return settings
 
+    def _iterate_all(self, model, product_info, tmp_dir, start_idx,
+                     n_total, pct_start, pct_end):
+        """Full fallback: iterate all elements with per-element errors."""
+        import ifcopenshell.geom
+
+        settings = self._geom_settings()
         try:
-            iterator = ifcopenshell.geom.iterator(settings, model, multiprocessing=True)
+            iterator = ifcopenshell.geom.iterator(
+                settings, model, multiprocessing=False
+            )
         except Exception:
             iterator = ifcopenshell.geom.iterator(settings, model)
 
         try:
             if not iterator.initialize():
-                self.load_error.emit("No geometry found in IFC file.")
-                return None
-        except Exception as exc:
-            self.load_error.emit(f"Geometry iterator failed:\n{exc}")
-            return None
+                return {}, []
+        except Exception:
+            return {}, []
 
         elements = {}
+        failed_list = []
+        idx = start_idx
         n_done = 0
-        idx = 0
-        n_total = len(model.by_type("IfcProduct"))
 
         while True:
+            if self.isInterruptionRequested():
+                break
+
+            guid = None
             try:
                 shape = iterator.get()
-                verts = np.array(shape.geometry.verts, dtype=np.float64).reshape(-1, 3)
-                faces = np.array(shape.geometry.faces, dtype=np.int64).reshape(-1, 3)
-                if len(verts) > 0 and len(faces) > 0:
-                    np.save(os.path.join(tmp_dir, f"{idx}_v.npy"), verts)
-                    np.save(os.path.join(tmp_dir, f"{idx}_f.npy"), faces)
-                    elements[shape.guid] = {"type": "", "cache_idx": idx}
-                    idx += 1
+                guid = shape.guid
+                try:
+                    verts = np.array(
+                        shape.geometry.verts, dtype=np.float64
+                    ).reshape(-1, 3)
+                    faces = np.array(
+                        shape.geometry.faces, dtype=np.int64
+                    ).reshape(-1, 3)
+                    if len(verts) > 0 and len(faces) > 0:
+                        np.save(
+                            os.path.join(tmp_dir, f"{idx}_v.npy"), verts
+                        )
+                        np.save(
+                            os.path.join(tmp_dir, f"{idx}_f.npy"), faces
+                        )
+                        elements[guid] = {
+                            "type": "", "cache_idx": idx,
+                        }
+                        idx += 1
+                except Exception as exc:
+                    info = product_info.get(guid, {})
+                    failed_list.append({
+                        "guid": guid,
+                        "type": info.get("type", ""),
+                        "name": info.get("name", ""),
+                        "error": str(exc)[:300],
+                    })
             except Exception:
                 pass
 
             n_done += 1
-            if n_done % 200 == 0:
-                self._log(f"Tessellating… {n_done} / {n_total}")
+            if n_done % 50 == 0:
+                pct = pct_start + int(
+                    (pct_end - pct_start) * n_done / max(n_total, 1)
+                )
+                info = product_info.get(guid, {}) if guid else {}
+                ifc_type = info.get("type", "Unknown")
+                self._emit(
+                    pct,
+                    f"Fallback — {ifc_type} "
+                    f"[{n_done:,} / {n_total:,}]",
+                )
 
             try:
                 if not iterator.next():
@@ -375,7 +626,120 @@ class LoaderThread(QThread):
             except Exception:
                 break
 
-        return elements
+        return elements, failed_list
+
+    def _iterate_guids(self, model, guids, product_info, tmp_dir,
+                       start_idx, pct_start, pct_end):
+        """Iterate specific GUIDs using create_shape."""
+        import ifcopenshell.geom
+
+        settings = self._geom_settings()
+        elements = {}
+        failed_list = []
+        idx = start_idx
+        n_total = len(guids)
+
+        for i, guid in enumerate(guids):
+            if self.isInterruptionRequested():
+                break
+            info = product_info.get(guid, {})
+            try:
+                el = model.by_guid(guid)
+                shape = ifcopenshell.geom.create_shape(settings, el)
+                verts = np.array(
+                    shape.geometry.verts, dtype=np.float64
+                ).reshape(-1, 3)
+                faces = np.array(
+                    shape.geometry.faces, dtype=np.int64
+                ).reshape(-1, 3)
+                if len(verts) > 0 and len(faces) > 0:
+                    np.save(
+                        os.path.join(tmp_dir, f"{idx}_v.npy"), verts
+                    )
+                    np.save(
+                        os.path.join(tmp_dir, f"{idx}_f.npy"), faces
+                    )
+                    elements[guid] = {
+                        "type": info.get("type", ""),
+                        "cache_idx": idx,
+                    }
+                    idx += 1
+            except Exception as exc:
+                failed_list.append({
+                    "guid": guid,
+                    "type": info.get("type", ""),
+                    "name": info.get("name", ""),
+                    "error": str(exc)[:300],
+                })
+
+            if (i + 1) % 50 == 0 or i == n_total - 1:
+                pct = pct_start + int(
+                    (pct_end - pct_start) * (i + 1) / max(n_total, 1)
+                )
+                self._emit(
+                    pct,
+                    f"Fallback — {info.get('type', 'Unknown')} "
+                    f"[{i + 1:,} / {n_total:,}]",
+                )
+
+        return elements, failed_list
+
+    # ── Skiplist I/O ───────────────────────────────────────────────
+
+    def _read_skiplist(self, path, ifc_mtime):
+        if not os.path.isfile(path):
+            return None
+        try:
+            with open(path, "r") as f:
+                data = json.load(f)
+            if abs(data.get("ifc_mtime", 0) - ifc_mtime) < 0.001:
+                return data
+            os.remove(path)
+        except Exception:
+            pass
+        return None
+
+    def _write_skiplist(self, path, ifc_mtime, failed_list):
+        try:
+            data = {"ifc_mtime": ifc_mtime, "corrupt": failed_list}
+            with open(path, "w") as f:
+                json.dump(data, f, indent=2)
+        except Exception:
+            pass
+
+    # ── Cache ──────────────────────────────────────────────────────
+
+    def _build_cache(self, cache_path, ifc_mtime, guids, types,
+                     elements, tmp_dir):
+        """Build .npz cache from temp files, renumbering indices."""
+        with zf.ZipFile(cache_path, 'w', zf.ZIP_STORED) as z:
+            for name, arr in [("_mtime", np.array(ifc_mtime)),
+                              ("_guids", np.array(guids)),
+                              ("_types", np.array(types))]:
+                buf = io.BytesIO()
+                np.save(buf, arr)
+                z.writestr(f"{name}.npy", buf.getvalue())
+
+            for new_idx, guid in enumerate(guids):
+                old_idx = elements[guid]["cache_idx"]
+
+                v = np.load(os.path.join(tmp_dir, f"{old_idx}_v.npy"))
+                buf = io.BytesIO()
+                np.save(buf, v)
+                z.writestr(f"v_{new_idx}.npy", buf.getvalue())
+                del v, buf
+
+                f = np.load(os.path.join(tmp_dir, f"{old_idx}_f.npy"))
+                buf = io.BytesIO()
+                np.save(buf, f)
+                z.writestr(f"f_{new_idx}.npy", buf.getvalue())
+                del f, buf
+
+        # Update elements to match new sequential cache indices
+        for new_idx, guid in enumerate(guids):
+            elements[guid]["cache_idx"] = new_idx
+
+    # ── Metadata helpers ───────────────────────────────────────────
 
     def _build_props(self, element):
         props = {
@@ -420,203 +784,94 @@ class LoaderThread(QThread):
         if projects:
             root = build_node(projects[0])
         else:
-            root = {"label": "(No Project)", "type": "", "guids": [], "children": []}
+            root = {
+                "label": "(No Project)",
+                "type": "", "guids": [], "children": [],
+            }
 
         return root
 
 
-# ── Chunked IFC → GLB converter thread ──────────────────────────────────────
+# ── GLB builder thread — reads npz cache, exports coloured GLB ──────────────
 
-CHUNK_SIZE = 500  # target elements per IfcConvert chunk
+class GlbBuilderThread(QThread):
+    """Background thread: build GLB from npz cache with vertex colours."""
 
+    build_complete = pyqtSignal(str)   # output GLB path
+    build_error    = pyqtSignal(str)
 
-class GlbConverterThread(QThread):
-    """Background thread: chunked IFC → GLB conversion using IfcConvert."""
-
-    status_update = pyqtSignal(str)
-    conversion_complete = pyqtSignal(str)  # output GLB path
-    conversion_error = pyqtSignal(str)
-
-    def __init__(self, path: str):
+    def __init__(self, cache_path: str, glb_path: str,
+                 glb_elements: dict):
         super().__init__()
-        self.path = path
-
-    def _log(self, msg: str):
-        print(f"[FreeIFC/GLB] {msg}", file=sys.stderr, flush=True)
-        self.status_update.emit(msg)
+        self.cache_path = cache_path
+        self.glb_path = glb_path
+        self.glb_elements = glb_elements  # guid → {type, cache_idx}
 
     def run(self):
-        glb_path = os.path.splitext(self.path)[0] + ".glb"
-
-        # ── Skip if GLB is already up to date ──────────────────────────
-        if os.path.isfile(glb_path):
-            ifc_mtime = os.path.getmtime(self.path)
-            glb_mtime = os.path.getmtime(glb_path)
-            if glb_mtime >= ifc_mtime:
-                self._log("GLB is up to date, skipping conversion.")
-                self.conversion_complete.emit(glb_path)
-                return
-
-        # ── Check prerequisites ────────────────────────────────────────
-        ifcconvert = shutil.which("IfcConvert") or shutil.which("ifcconvert")
-        if not ifcconvert:
-            self.conversion_error.emit("IfcConvert not found on PATH.")
-            return
-
         try:
-            import trimesh  # noqa: F811
+            self._run_impl()
+        except Exception as exc:
+            self.build_error.emit(f"GLB build error: {exc}")
+
+    def _run_impl(self):
+        try:
+            import trimesh
         except ImportError:
-            self.conversion_error.emit("trimesh not installed.")
+            self.build_error.emit("trimesh not installed")
             return
 
-        # ── Open IFC and group elements by type ────────────────────────
-        self._log("Analysing IFC for chunked GLB conversion…")
-        try:
-            model = ifcopenshell.open(self.path)
-        except Exception as exc:
-            self.conversion_error.emit(f"Failed to open IFC: {exc}")
-            return
-
-        type_counts: dict[str, int] = {}
-        for product in model.by_type("IfcProduct"):
-            t = product.is_a()
-            type_counts[t] = type_counts.get(t, 0) + 1
-        del model  # free memory
-
-        if not type_counts:
-            self.conversion_error.emit("No IfcProduct elements found.")
-            return
-
-        # ── Bundle types into chunks of ~CHUNK_SIZE elements ───────────
-        chunks: list[list[str]] = []
-        current_chunk: list[str] = []
-        current_count = 0
-        for ifc_type, count in type_counts.items():
-            if current_count > 0 and current_count + count > CHUNK_SIZE:
-                chunks.append(current_chunk)
-                current_chunk = []
-                current_count = 0
-            current_chunk.append(ifc_type)
-            current_count += count
-        if current_chunk:
-            chunks.append(current_chunk)
-
-        total_elements = sum(type_counts.values())
-        self._log(
-            f"Converting {total_elements} elements in {len(chunks)} chunk(s)…"
-        )
-
-        # ── Convert each chunk ─────────────────────────────────────────
-        tmp_dir = tempfile.mkdtemp(prefix="freeifc_glb_")
-        chunk_glbs: list[str] = []
-        try:
-            for i, chunk_types in enumerate(chunks):
-                chunk_elems = sum(type_counts[t] for t in chunk_types)
-                self._log(
-                    f"Chunk {i + 1}/{len(chunks)}: "
-                    f"{', '.join(chunk_types)} ({chunk_elems} elements)"
-                )
-                result = self._convert_chunk(
-                    ifcconvert, tmp_dir, i, chunk_types
-                )
-                if result:
-                    chunk_glbs.append(result)
-
-            if not chunk_glbs:
-                self.conversion_error.emit(
-                    "All chunks failed — no GLB produced."
-                )
+        # Skip if GLB is newer than npz
+        if os.path.isfile(self.glb_path) and os.path.isfile(self.cache_path):
+            if (os.path.getmtime(self.glb_path)
+                    >= os.path.getmtime(self.cache_path)):
+                self.build_complete.emit(self.glb_path)
                 return
 
-            # ── Merge chunk GLBs ───────────────────────────────────────
-            self._log(f"Merging {len(chunk_glbs)} GLB fragment(s)…")
-            self._merge_glbs(chunk_glbs, glb_path)
-
-        finally:
-            shutil.rmtree(tmp_dir, ignore_errors=True)
-
-        if os.path.isfile(glb_path):
-            size_mb = os.path.getsize(glb_path) / 1048576
-            self._log(f"GLB ready: {glb_path} ({size_mb:.1f} MB)")
-            self.conversion_complete.emit(glb_path)
-        else:
-            self.conversion_error.emit("GLB merge produced no output.")
-
-    def _convert_chunk(
-        self, ifcconvert: str, tmp_dir: str, idx: int, types: list[str]
-    ) -> str | None:
-        """Extract subset IFC, run IfcConvert, return GLB path or None."""
-        try:
-            import ifcpatch
-
-            model = ifcopenshell.open(self.path)
-            query = ", ".join(types)
-            subset = ifcpatch.execute({
-                "input": self.path,
-                "file": model,
-                "recipe": "ExtractElements",
-                "arguments": [query],
-            })
-            del model
-
-            subset_ifc = os.path.join(tmp_dir, f"chunk_{idx}.ifc")
-            subset.write(subset_ifc)
-            del subset
-        except Exception as exc:
-            self._log(f"  Chunk {idx + 1} extract failed: {exc}")
-            return None
-
-        chunk_glb = os.path.join(tmp_dir, f"chunk_{idx}.glb")
-        try:
-            ncpu = os.cpu_count() or 4
-            result = subprocess.run(
-                [ifcconvert, "--use-element-guids", "-j", str(ncpu),
-                 subset_ifc, chunk_glb],
-                capture_output=True, text=True, timeout=120,
-            )
-            if result.returncode != 0:
-                stderr = (result.stderr or "").strip()[:200]
-                self._log(f"  Chunk {idx + 1} IfcConvert failed: {stderr}")
-                return None
-        except subprocess.TimeoutExpired:
-            self._log(f"  Chunk {idx + 1} timed out (120s)")
-            return None
-        except Exception as exc:
-            self._log(f"  Chunk {idx + 1} error: {exc}")
-            return None
-        finally:
-            try:
-                os.remove(subset_ifc)
-            except Exception:
-                pass
-
-        if os.path.isfile(chunk_glb):
-            return chunk_glb
-        return None
-
-    def _merge_glbs(self, chunk_glbs: list[str], output_path: str):
-        """Merge multiple GLB files into one. Fallback: keep largest."""
-        import trimesh
-
-        if len(chunk_glbs) == 1:
-            shutil.copy2(chunk_glbs[0], output_path)
+        if not os.path.isfile(self.cache_path):
+            self.build_error.emit("Cache file not found")
             return
 
+        cache = np.load(self.cache_path, allow_pickle=True)
         try:
-            combined = trimesh.Scene()
-            for glb_path in chunk_glbs:
-                scene = trimesh.load(glb_path, process=False)
-                if isinstance(scene, trimesh.Scene):
-                    for name, geom in scene.geometry.items():
-                        T, _ = scene.graph[name] if name in scene.graph.nodes_geometry else (np.eye(4), name)
-                        combined.add_geometry(geom, node_name=name, transform=T)
-                elif hasattr(scene, "vertices"):
-                    combined.add_geometry(scene)
-            combined.export(output_path, file_type="glb")
-        except Exception as exc:
-            self._log(f"Merge failed ({exc}), using largest chunk as fallback")
-            largest = max(chunk_glbs, key=os.path.getsize)
-            shutil.copy2(largest, output_path)
+            scene = trimesh.Scene()
+            for guid, elem in self.glb_elements.items():
+                if self.isInterruptionRequested():
+                    return
+                i = elem["cache_idx"]
+                try:
+                    verts = np.array(cache[f"v_{i}"], dtype=np.float64)
+                    faces = np.array(cache[f"f_{i}"], dtype=np.int64)
+                except KeyError:
+                    continue
+                if len(verts) == 0 or len(faces) == 0:
+                    continue
+
+                ifc_type = elem.get("type", "")
+                colour = TYPE_COLOURS.get(ifc_type, DEFAULT_COLOUR)
+                vc = np.full((len(verts), 4), 255, dtype=np.uint8)
+                vc[:, 0] = int(colour[0] * 255)
+                vc[:, 1] = int(colour[1] * 255)
+                vc[:, 2] = int(colour[2] * 255)
+
+                mesh = trimesh.Trimesh(
+                    vertices=verts, faces=faces,
+                    vertex_colors=vc, process=False,
+                )
+                scene.add_geometry(mesh, node_name=guid)
+
+            scene.export(self.glb_path, file_type="glb")
+        finally:
+            cache.close()
+
+        if os.path.isfile(self.glb_path):
+            size_mb = os.path.getsize(self.glb_path) / 1048576
+            print(
+                f"[FreeIFC/GLB] Built: {self.glb_path} ({size_mb:.1f} MB)",
+                file=sys.stderr, flush=True,
+            )
+            self.build_complete.emit(self.glb_path)
+        else:
+            self.build_error.emit("GLB export produced no output")
 
 
 # ── Ground plane grid ────────────────────────────────────────────────────────
@@ -709,6 +964,152 @@ class ColourSwatchButton(QPushButton):
             self.colour_changed.emit(c)
 
 
+# ── Fallback warning widget ──────────────────────────────────────────────────
+
+class FallbackWarningWidget(QFrame):
+    """Sidebar widget showing fallback / failed element warnings."""
+
+    element_clicked = pyqtSignal(str)  # guid
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.hide()
+        self.setStyleSheet(
+            "FallbackWarningWidget {"
+            "  background: #1a1b1f;"
+            "  border-left: 2px solid #3a3b40;"
+            "}"
+        )
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(8, 6, 8, 6)
+        layout.setSpacing(0)
+
+        # Fallback section
+        self._fb_header = QPushButton()
+        self._fb_header.setFlat(True)
+        self._fb_header.setStyleSheet(
+            "color: #f0a500; text-align: left; padding: 4px 0; "
+            "font-size: 12px; border: none; background: transparent;"
+        )
+        self._fb_header.clicked.connect(self._toggle_fb)
+        self._fb_container = QWidget()
+        self._fb_layout = QVBoxLayout(self._fb_container)
+        self._fb_layout.setContentsMargins(8, 2, 0, 2)
+        self._fb_layout.setSpacing(1)
+        self._fb_container.hide()
+        layout.addWidget(self._fb_header)
+        layout.addWidget(self._fb_container)
+
+        # Separator between sections
+        self._separator = QFrame()
+        self._separator.setFrameShape(QFrame.Shape.HLine)
+        self._separator.setStyleSheet("color: #3a3b40;")
+        self._separator.hide()
+        layout.addWidget(self._separator)
+
+        # Failed section
+        self._fail_header = QPushButton()
+        self._fail_header.setFlat(True)
+        self._fail_header.setStyleSheet(
+            "color: #e05555; text-align: left; padding: 4px 0; "
+            "font-size: 12px; border: none; background: transparent;"
+        )
+        self._fail_header.clicked.connect(self._toggle_fail)
+        self._fail_container = QWidget()
+        self._fail_layout = QVBoxLayout(self._fail_container)
+        self._fail_layout.setContentsMargins(8, 2, 0, 2)
+        self._fail_layout.setSpacing(1)
+        self._fail_container.hide()
+        layout.addWidget(self._fail_header)
+        layout.addWidget(self._fail_container)
+
+        self._fb_header.hide()
+        self._fail_header.hide()
+
+    def _toggle_fb(self):
+        self._fb_container.setVisible(not self._fb_container.isVisible())
+
+    def _toggle_fail(self):
+        self._fail_container.setVisible(not self._fail_container.isVisible())
+
+    def populate(self, fallback_elements, failed_elements):
+        self.clear()
+        has_fb = bool(fallback_elements)
+        has_fail = bool(failed_elements)
+
+        if not has_fb and not has_fail:
+            self.hide()
+            return
+
+        if has_fb:
+            n = len(fallback_elements)
+            self._fb_header.setText(
+                f"\u26a0 {n} element(s) used fallback tessellation"
+            )
+            self._fb_header.show()
+            for entry in fallback_elements:
+                label = (
+                    f"{entry.get('type', '')}  "
+                    f"{entry.get('name', '')}"
+                )
+                btn = QPushButton(label)
+                btn.setFlat(True)
+                btn.setStyleSheet(
+                    "color: #d4d4d4; text-align: left; padding: 2px 0; "
+                    "font-size: 11px; border: none; "
+                    "background: transparent;"
+                )
+                btn.setCursor(Qt.CursorShape.PointingHandCursor)
+                guid = entry["guid"]
+                btn.clicked.connect(
+                    lambda checked, g=guid: self.element_clicked.emit(g)
+                )
+                self._fb_layout.addWidget(btn)
+
+        if has_fail:
+            n = len(failed_elements)
+            self._fail_header.setText(
+                f"\u2715 {n} element(s) failed — excluded from scene"
+            )
+            self._fail_header.show()
+            for entry in failed_elements:
+                label = (
+                    f"{entry.get('type', '')}  "
+                    f"{entry.get('name', '')}"
+                )
+                lbl = QLabel(label)
+                lbl.setStyleSheet(
+                    "color: #a06060; font-size: 11px; padding: 2px 0;"
+                )
+                lbl.setToolTip(entry.get("error", ""))
+                self._fail_layout.addWidget(lbl)
+
+        if has_fb and has_fail:
+            self._separator.show()
+
+        self.show()
+
+    def clear(self):
+        self._fb_container.hide()
+        self._fail_container.hide()
+        self._fb_header.hide()
+        self._fail_header.hide()
+        self._separator.hide()
+
+        while self._fb_layout.count():
+            w = self._fb_layout.takeAt(0).widget()
+            if w:
+                w.deleteLater()
+
+        while self._fail_layout.count():
+            w = self._fail_layout.takeAt(0).widget()
+            if w:
+                w.deleteLater()
+
+        self.hide()
+
+
 # ── Main window ──────────────────────────────────────────────────────────────
 
 class FreeIFCWindow(QMainWindow):
@@ -751,7 +1152,8 @@ class FreeIFCWindow(QMainWindow):
         self._selected_guid: str | None = None
         self._selection_outline: vtkActor | None = None
         self._loader: LoaderThread | None = None
-        self._glb_converter: GlbConverterThread | None = None
+        self._glb_builder: GlbBuilderThread | None = None
+        self._ifc_path: str | None = None
         self._loading = False
         self._edges_visible = True
         self._lod_enabled = False
@@ -821,7 +1223,7 @@ class FreeIFCWindow(QMainWindow):
         # Progress bar
         self._progress = QProgressBar()
         self._progress.setTextVisible(True)
-        self._progress.setFormat("%v / %m elements")
+        self._progress.setFormat("%p%")
         self._progress.hide()
         side_layout.addWidget(self._progress)
 
@@ -829,6 +1231,13 @@ class FreeIFCWindow(QMainWindow):
         self._progress_label = QLabel("")
         self._progress_label.hide()
         side_layout.addWidget(self._progress_label)
+
+        # Fallback warning widget
+        self._fallback_warning = FallbackWarningWidget()
+        self._fallback_warning.element_clicked.connect(
+            self._on_warning_element_clicked
+        )
+        side_layout.addWidget(self._fallback_warning)
 
         # Separator
         sep1 = QFrame()
@@ -1334,33 +1743,30 @@ class FreeIFCWindow(QMainWindow):
         self._clear_scene()
 
         self._loading = True
+        self._ifc_path = path
         self._open_btn.setEnabled(False)
         self.setAcceptDrops(False)
-        self._progress.setMaximum(0)  # indeterminate
+        self._progress.setMaximum(100)
+        self._progress.setValue(0)
         self._progress.show()
-        self._progress_label.setText("Starting…")
+        self._progress_label.setText("Scanning IFC metadata…")
         self._progress_label.show()
 
         self.setWindowTitle(f"FreeIFC — {os.path.basename(path)}")
 
         self._loader = LoaderThread(path)
-        self._loader.status_update.connect(self._on_status_update)
+        self._loader.load_progress.connect(self._on_load_progress)
         self._loader.load_complete.connect(self._on_load_complete)
         self._loader.load_error.connect(self._on_load_error)
         self._loader.start()
 
-        # Start GLB conversion in parallel (does not block viewer)
-        self._glb_converter = GlbConverterThread(path)
-        self._glb_converter.conversion_complete.connect(self._on_glb_complete)
-        self._glb_converter.conversion_error.connect(self._on_glb_error)
-        self._glb_converter.start()
-
     def _clear_scene(self):
         self._deselect()
-        if self._glb_converter is not None:
-            self._glb_converter.quit()
-            self._glb_converter.wait(2000)
-            self._glb_converter = None
+        if self._glb_builder is not None:
+            self._glb_builder.requestInterruption()
+            self._glb_builder.wait(2000)
+            self._glb_builder = None
+        self._fallback_warning.clear()
         if self._edge_build_timer is not None:
             self._edge_build_timer.stop()
             self._edge_build_timer = None
@@ -1381,8 +1787,10 @@ class FreeIFCWindow(QMainWindow):
 
     # ── Loader signals ───────────────────────────────────────────────────
 
-    def _on_status_update(self, msg: str):
-        self._progress_label.setText(msg)
+    def _on_load_progress(self, percent: int, label: str):
+        self._progress.setMaximum(100)
+        self._progress.setValue(percent)
+        self._progress_label.setText(label)
 
     def _on_load_complete(self, data: dict):
         self._loading = False
@@ -1405,9 +1813,14 @@ class FreeIFCWindow(QMainWindow):
             ifc_type = elem.get("type", "Unknown")
             type_map.setdefault(ifc_type, []).append(guid)
 
-        # Build merged actors per type
-        self._progress_label.setText("Building scene…")
-        for ifc_type, guids in type_map.items():
+        # Phase 4: Build merged actors per type (85–92%)
+        total_types = len(type_map)
+        for i, (ifc_type, guids) in enumerate(type_map.items()):
+            pct = 85 + int(7 * (i + 1) / max(total_types, 1))
+            self._progress.setValue(pct)
+            self._progress_label.setText(
+                f"Building scene — type {i + 1}/{total_types}"
+            )
             self._type_groups[ifc_type] = {
                 "guids": guids,
                 "actor": None,
@@ -1434,13 +1847,41 @@ class FreeIFCWindow(QMainWindow):
         self.renderer.ResetCameraClippingRange()
         self._vtk_widget.GetRenderWindow().Render()
 
-        # Build edges in background after scene is visible
-        self._progress_label.setText("Building edges…")
+        # Populate warning widget
+        fallback_elements = data.get("fallback_elements", [])
+        failed_elements = data.get("failed_elements", [])
+        self._fallback_warning.populate(fallback_elements, failed_elements)
+
+        # Phase 5: Build edges in background after scene is visible
+        self._progress.setValue(92)
+        self._progress_label.setText("Building edges — 0/0 types")
         self._edge_build_queue = list(self._type_groups.keys())
         self._edge_build_timer = QTimer()
         self._edge_build_timer.setInterval(0)
         self._edge_build_timer.timeout.connect(self._build_edges_batch)
         self._edge_build_timer.start()
+
+        # Start GLB builder with 500ms delay
+        if cache_path and os.path.isfile(cache_path) and self._ifc_path:
+            glb_path = os.path.splitext(self._ifc_path)[0] + ".glb"
+            glb_elements = {
+                guid: {"type": elem["type"], "cache_idx": elem["cache_idx"]}
+                for guid, elem in self._elements.items()
+                if "cache_idx" in elem and not elem.get("failed")
+            }
+            QTimer.singleShot(
+                500, lambda: self._start_glb_builder(
+                    cache_path, glb_path, glb_elements
+                )
+            )
+
+    def _start_glb_builder(self, cache_path, glb_path, glb_elements):
+        self._glb_builder = GlbBuilderThread(
+            cache_path, glb_path, glb_elements
+        )
+        self._glb_builder.build_complete.connect(self._on_glb_complete)
+        self._glb_builder.build_error.connect(self._on_glb_error)
+        self._glb_builder.start()
 
     def _on_load_error(self, msg: str):
         self._loading = False
@@ -1450,7 +1891,7 @@ class FreeIFCWindow(QMainWindow):
         self._progress_label.setText(msg)
         self._progress_label.show()
 
-    # ── GLB converter signals ────────────────────────────────────────────
+    # ── GLB builder signals ──────────────────────────────────────────────
 
     def _on_glb_complete(self, glb_path: str):
         title = self.windowTitle().replace(" [GLB ready]", "")
@@ -1459,12 +1900,18 @@ class FreeIFCWindow(QMainWindow):
     def _on_glb_error(self, msg: str):
         print(f"[FreeIFC/GLB] Error: {msg}", file=sys.stderr, flush=True)
 
+    def _on_warning_element_clicked(self, guid: str):
+        self._select(guid)
+        self._vtk_widget.GetRenderWindow().Render()
+
     # ── On-demand geometry loading ───────────────────────────────────────
 
     def _load_geom(self, guid):
         """Load geometry for a single element from cache on demand."""
         elem = self._elements.get(guid)
         if elem is None or self._cache is None:
+            return None, None
+        if elem.get("failed") or "cache_idx" not in elem:
             return None, None
         i = elem["cache_idx"]
         return self._cache[f"v_{i}"], self._cache[f"f_{i}"]
@@ -1601,6 +2048,7 @@ class FreeIFCWindow(QMainWindow):
         if not self._edge_build_queue:
             self._edge_build_timer.stop()
             self._edge_build_timer = None
+            self._progress.setValue(100)
             self._progress.hide()
             self._progress_label.hide()
             self._vtk_widget.GetRenderWindow().Render()
@@ -1610,7 +2058,10 @@ class FreeIFCWindow(QMainWindow):
         self._rebuild_type_edges(ifc_type)
         remaining = len(self._edge_build_queue)
         total = len(self._type_groups)
-        self._progress_label.setText(f"Building edges… {total - remaining} / {total} types")
+        done = total - remaining
+        pct = 92 + int(8 * done / max(total, 1))
+        self._progress.setValue(pct)
+        self._progress_label.setText(f"Building edges — {done}/{total} types")
         if remaining % 3 == 0:
             self._vtk_widget.GetRenderWindow().Render()
 
